@@ -1,0 +1,32 @@
+# Python bytecode
+scripts/__pycache__/
+*.pyc
+build/
+# Databases and results (generated data)
+*.db
+results/
+smoke_out_2/
+smoke_out/
+reaxff_smoke.lib
+tests/
+#metadata of the package
+build/
+dist/
+*.egg-info/
+pygulp-cluster.spec
+# Experiment outputs (if they are generated and not input)
+tests/experiment/CalcFold/
+!tests/experiment/CalcFold/*.gin   # keep template input files if needed
+
+# Virtual environment
+venv/
+env/
+.env
+
+# IDE settings (if any)
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
