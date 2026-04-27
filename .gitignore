@@ -13,7 +13,6 @@ tests/
 build/
 dist/
 *.egg-info/
-pygulp-cluster.spec
 # Experiment outputs (if they are generated and not input)
 tests/experiment/CalcFold/
 !tests/experiment/CalcFold/*.gin   # keep template input files if needed
