@@ -386,8 +386,7 @@ def copy_selected_library(library_source: Path, calc_dir: Path) -> str:
     return destination.name
 
 
-def enrich_row_from_outputs(row: dict[str, object], structure_path: Path, got_path: Path) -> dict[str, object]:
-    atoms = read(structure_path)
+def enrich_row_from_outputs(row: dict[str, object], got_path: Path) -> dict[str, object]:
     got_data = parse_got(got_path)
     row["energy_initial_ev"] = got_data["energy_initial_ev"]
     row["energy_final_ev"] = got_data["energy_final_ev"]
@@ -408,7 +407,9 @@ def enrich_row_from_outputs(row: dict[str, object], structure_path: Path, got_pa
         except (TypeError, ValueError):
             volume_float = None
         if volume_float and volume_float > 0:
-            row["density_g_cm3"] = float(atoms.get_masses().sum()) * 1.66053906660 / volume_float
+            total_mass_amu = row.get("_total_mass_amu")
+            if isinstance(total_mass_amu, (int, float)) and total_mass_amu > 0:
+                row["density_g_cm3"] = float(total_mass_amu) * 1.66053906660 / volume_float
 
     return got_data
 
@@ -464,6 +465,7 @@ def prepare_structure(
         atoms.set_pbc([True, True, True])
         row["n_atoms"] = len(atoms)
         row["formula"] = atoms.get_chemical_formula()
+        row["_total_mass_amu"] = float(atoms.get_masses().sum())
 
         shutil.copy2(poscar, work_dir / poscar.name)
         write(input_cif_path, atoms)
@@ -665,13 +667,17 @@ def wait_for_jobs(
         for job_id in finished_ids:
             job = active.pop(job_id)
             slurm_state = final_states.get(job_id, "UNKNOWN")
-            got_data = enrich_row_from_outputs(job.row, job.input_cif_path, job.got_path)
-            job.row["status"] = determine_final_status(slurm_state, got_data, job.relaxed_cif_path)
+            try:
+                got_data = enrich_row_from_outputs(job.row, job.got_path)
+                job.row["status"] = determine_final_status(slurm_state, got_data, job.relaxed_cif_path)
+            except Exception as exc:
+                job.row["status"] = "postprocess_failed"
+                log_message(log_path, f"[{job.index}] postprocess failed for job {job_id}: {exc!r}")
             log_message(log_path, f"[{job.index}] finished job {job_id} with status {job.row['status']}")
             write_summary(args.output_dir, rows, summary_basename)
 
 
-def collect_existing_result(index: int, poscar: Path, args) -> dict[str, object]:
+def collect_existing_result(index: int, poscar: Path, args, log_path: Path) -> dict[str, object]:
     name = f"{index:05d}_{sanitize_name(poscar.stem)}"
     work_dir = args.output_dir / name
     calc_dir = work_dir / "CalcFold"
@@ -688,6 +694,7 @@ def collect_existing_result(index: int, poscar: Path, args) -> dict[str, object]
         atoms = read(poscar, format=args.format)
         row["n_atoms"] = len(atoms)
         row["formula"] = atoms.get_chemical_formula()
+        row["_total_mass_amu"] = float(atoms.get_masses().sum())
     except Exception:
         pass
 
@@ -700,9 +707,12 @@ def collect_existing_result(index: int, poscar: Path, args) -> dict[str, object]
         )
 
     if got_path.exists():
-        structure_path = input_cif_path if input_cif_path.exists() else poscar
-        got_data = enrich_row_from_outputs(row, structure_path, got_path)
-        row["status"] = determine_final_status("COMPLETED", got_data, relaxed_cif_path)
+        try:
+            got_data = enrich_row_from_outputs(row, got_path)
+            row["status"] = determine_final_status("COMPLETED", got_data, relaxed_cif_path)
+        except Exception as exc:
+            row["status"] = "collect_failed"
+            log_message(log_path, f"[{index}] collect failed for {poscar}: {exc!r}")
     elif gin_path.exists():
         row["status"] = "prepared"
 
@@ -735,7 +745,7 @@ def run_pipeline(args) -> int:
     summary_basename = f"summary_task_{args.task_id:05d}" if args.task_id is not None else "summary"
 
     if args.collect_only:
-        rows = [collect_existing_result(index, poscar, args) for index, poscar in indexed_poscars]
+        rows = [collect_existing_result(index, poscar, args, log_path) for index, poscar in indexed_poscars]
         csv_path, _ = write_summary(args.output_dir, rows, summary_basename)
         log_message(log_path, f"Wrote summary to {csv_path}")
         return 0

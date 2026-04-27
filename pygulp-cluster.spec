@@ -1,11 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files
+
+
+ase_spacegroup_datas = collect_data_files('ase.spacegroup')
 
 a = Analysis(
     ['src/pygulp/cli.py'],
     pathex=['src'],
     binaries=[],
-    datas=[],
+    datas=ase_spacegroup_datas,
     hiddenimports=['ase.io.cif'],
     hookspath=[],
     hooksconfig={},
