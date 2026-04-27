@@ -7,7 +7,4 @@ cd "$ROOT_DIR"
 python3 -m PyInstaller \
   --clean \
   --noconfirm \
-  --onefile \
-  --name pygulp-cluster \
-  --paths src \
-  src/pygulp/cli.py
+  pygulp-cluster.spec
