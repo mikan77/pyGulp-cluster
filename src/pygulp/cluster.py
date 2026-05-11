@@ -38,6 +38,8 @@ SUMMARY_FIELDS = (
     "energy_initial_ev",
     "energy_final_ev",
     "volume",
+    "symmetry",
+    "symmetry_number",
     "runtime_seconds",
     "density_g_cm3",
     "energy_initial_ev_per_atom",
@@ -548,6 +550,27 @@ def rewrite_relaxed_cif_with_symmetry(
     return row
 
 
+def detect_relaxed_cif_symmetry(
+    relaxed_cif_path: Path,
+    symprec: float,
+    angle_tolerance: float,
+) -> tuple[str | None, int | None]:
+    if not relaxed_cif_path.exists():
+        return None, None
+
+    try:
+        from pymatgen.core import Structure
+        from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            structure = Structure.from_file(str(relaxed_cif_path))
+            analyzer = SpacegroupAnalyzer(structure, symprec=symprec, angle_tolerance=angle_tolerance)
+            return analyzer.get_space_group_symbol(), analyzer.get_space_group_number()
+    except Exception:
+        return None, None
+
+
 def base_row(index: int, name: str, poscar: Path, work_dir: Path) -> dict[str, object]:
     row = {field: None for field in SUMMARY_FIELDS}
     row.update(
@@ -569,7 +592,13 @@ def copy_selected_library(library_source: Path, calc_dir: Path) -> str:
     return destination.name
 
 
-def enrich_row_from_outputs(row: dict[str, object], got_path: Path) -> dict[str, object]:
+def enrich_row_from_outputs(
+    row: dict[str, object],
+    got_path: Path,
+    relaxed_cif_path: Path | None = None,
+    symprec: float = 0.01,
+    angle_tolerance: float = 5.0,
+) -> dict[str, object]:
     got_data = parse_got(got_path)
     row["energy_initial_ev"] = got_data["energy_initial_ev"]
     row["energy_final_ev"] = got_data["energy_final_ev"]
@@ -593,6 +622,15 @@ def enrich_row_from_outputs(row: dict[str, object], got_path: Path) -> dict[str,
             total_mass_amu = row.get("_total_mass_amu")
             if isinstance(total_mass_amu, (int, float)) and total_mass_amu > 0:
                 row["density_g_cm3"] = float(total_mass_amu) * 1.66053906660 / volume_float
+
+    if relaxed_cif_path is not None:
+        symmetry, symmetry_number = detect_relaxed_cif_symmetry(
+            relaxed_cif_path=relaxed_cif_path,
+            symprec=symprec,
+            angle_tolerance=angle_tolerance,
+        )
+        row["symmetry"] = symmetry
+        row["symmetry_number"] = symmetry_number
 
     return got_data
 
@@ -851,7 +889,13 @@ def wait_for_jobs(
             job = active.pop(job_id)
             slurm_state = final_states.get(job_id, "UNKNOWN")
             try:
-                got_data = enrich_row_from_outputs(job.row, job.got_path)
+                got_data = enrich_row_from_outputs(
+                    row=job.row,
+                    got_path=job.got_path,
+                    relaxed_cif_path=job.relaxed_cif_path,
+                    symprec=args.relaxed_cif_symprec,
+                    angle_tolerance=args.relaxed_cif_angle_tolerance,
+                )
                 job.row["status"] = determine_final_status(slurm_state, got_data, job.relaxed_cif_path)
             except Exception as exc:
                 job.row["status"] = "postprocess_failed"
@@ -891,7 +935,13 @@ def collect_existing_result(index: int, poscar: Path, args, log_path: Path) -> d
 
     if got_path.exists():
         try:
-            got_data = enrich_row_from_outputs(row, got_path)
+            got_data = enrich_row_from_outputs(
+                row=row,
+                got_path=got_path,
+                relaxed_cif_path=relaxed_cif_path,
+                symprec=args.relaxed_cif_symprec,
+                angle_tolerance=args.relaxed_cif_angle_tolerance,
+            )
             row["status"] = determine_final_status("COMPLETED", got_data, relaxed_cif_path)
         except Exception as exc:
             row["status"] = "collect_failed"
