@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,18 @@ SUMMARY_FIELDS = (
     "energy_initial_ev_per_atom",
     "energy_final_ev_per_atom",
 )
+RELAXED_CIF_SUMMARY_FIELDS = (
+    "calculation",
+    "status",
+    "source_cif",
+    "output_cif",
+    "spacegroup_symbol",
+    "spacegroup_number",
+    "n_sites_input",
+    "n_sites_output",
+    "mode",
+    "message",
+)
 @dataclass
 class PreparedJob:
     index: int
@@ -75,6 +88,47 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--prepare-only", action="store_true", help="Only generate CalcFold inputs and job scripts.")
     parser.add_argument("--collect-only", action="store_true", help="Rebuild summary tables from existing work directories.")
+    parser.add_argument(
+        "--collect-relaxed-cifs",
+        action="store_true",
+        help="Collect CalcFold/relaxed.cif files into one folder after rewriting them with pymatgen symmetry.",
+    )
+    parser.add_argument(
+        "--relaxed-cif-dir",
+        type=Path,
+        default=None,
+        help="Output directory for collected CIF files. Relative paths are resolved under --output-dir.",
+    )
+    parser.add_argument(
+        "--relaxed-cif-mode",
+        "--cif-structure-mode",
+        dest="relaxed_cif_mode",
+        choices=("refined", "conventional", "primitive"),
+        default="refined",
+        help="Structure representation used before writing collected CIF files.",
+    )
+    parser.add_argument(
+        "--relaxed-cif-symprec",
+        "--symprec",
+        dest="relaxed_cif_symprec",
+        type=float,
+        default=0.01,
+        help="Symmetry precision passed to pymatgen when rewriting collected CIF files.",
+    )
+    parser.add_argument(
+        "--relaxed-cif-angle-tolerance",
+        "--angle-tolerance",
+        dest="relaxed_cif_angle_tolerance",
+        type=float,
+        default=5.0,
+        help="Angle tolerance passed to pymatgen when rewriting collected CIF files.",
+    )
+    parser.add_argument(
+        "--relaxed-cif-significant-figures",
+        type=int,
+        default=8,
+        help="Number of significant figures used when writing collected CIF files.",
+    )
     parser.add_argument("--submit-jobs", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--max-parallel",
@@ -363,6 +417,135 @@ def write_summary(output_dir: Path, rows: list[dict[str, object]], basename: str
             fd.write(json.dumps(payload) + "\n")
 
     return csv_path, jsonl_path
+
+
+def write_relaxed_cif_summary(output_dir: Path, rows: list[dict[str, object]]) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "relaxed_cifs_summary.csv"
+    jsonl_path = output_dir / "relaxed_cifs_summary.jsonl"
+
+    with csv_path.open("w", newline="") as fd:
+        writer = csv.DictWriter(fd, fieldnames=RELAXED_CIF_SUMMARY_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in RELAXED_CIF_SUMMARY_FIELDS})
+
+    with jsonl_path.open("w") as fd:
+        for row in rows:
+            payload = {field: row.get(field) for field in RELAXED_CIF_SUMMARY_FIELDS}
+            fd.write(json.dumps(payload) + "\n")
+
+    return csv_path, jsonl_path
+
+
+def resolve_relaxed_cif_output_dir(output_dir: Path, relaxed_cif_dir: Path | None) -> Path:
+    if relaxed_cif_dir is None:
+        return output_dir / "relaxed_cifs"
+
+    resolved = relaxed_cif_dir.expanduser()
+    if not resolved.is_absolute():
+        resolved = output_dir / resolved
+    return resolved.resolve()
+
+
+def structure_for_relaxed_cif_mode(analyzer, mode: str):
+    if mode == "refined":
+        return analyzer.get_refined_structure()
+    if mode == "conventional":
+        return analyzer.get_conventional_standard_structure()
+    if mode == "primitive":
+        structure = analyzer.get_primitive_standard_structure()
+        if structure is None:
+            structure = analyzer.find_primitive()
+        if structure is None:
+            raise ValueError("pymatgen could not build a primitive structure")
+        return structure
+    raise ValueError(f"Unknown relaxed CIF mode: {mode}")
+
+
+def rewrite_relaxed_cif_with_symmetry(
+    source_cif: Path,
+    output_cif: Path,
+    mode: str,
+    symprec: float,
+    angle_tolerance: float,
+    significant_figures: int,
+) -> dict[str, object]:
+    row: dict[str, object] = {field: None for field in RELAXED_CIF_SUMMARY_FIELDS}
+    row.update(
+        {
+            "status": "started",
+            "source_cif": str(source_cif),
+            "output_cif": str(output_cif),
+            "mode": mode,
+        }
+    )
+    structure = None
+    captured_warnings: list[str] = []
+
+    try:
+        from pymatgen.core import Structure
+        from pymatgen.io.cif import CifWriter
+        from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            structure = Structure.from_file(str(source_cif))
+            row["n_sites_input"] = len(structure)
+
+            analyzer = SpacegroupAnalyzer(structure, symprec=symprec, angle_tolerance=angle_tolerance)
+            spacegroup_symbol = analyzer.get_space_group_symbol()
+            spacegroup_number = analyzer.get_space_group_number()
+            converted = structure_for_relaxed_cif_mode(analyzer, mode)
+
+            output_cif.parent.mkdir(parents=True, exist_ok=True)
+            writer = CifWriter(
+                converted,
+                symprec=symprec,
+                angle_tolerance=angle_tolerance,
+                significant_figures=significant_figures,
+                refine_struct=False,
+            )
+            writer.write_file(str(output_cif))
+            captured_warnings = [str(item.message) for item in caught]
+
+        row["spacegroup_symbol"] = spacegroup_symbol
+        row["spacegroup_number"] = spacegroup_number
+        row["n_sites_output"] = len(converted)
+        if spacegroup_number == 1:
+            row["status"] = "written_p1"
+            row["message"] = "symmetry resolved as P1 with the selected tolerances"
+        else:
+            row["status"] = "written"
+            row["message"] = "; ".join(captured_warnings[:3])
+    except Exception as exc:
+        if structure is None:
+            row["status"] = "failed"
+            row["message"] = repr(exc)
+            return row
+
+        try:
+            from pymatgen.io.cif import CifWriter
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                output_cif.parent.mkdir(parents=True, exist_ok=True)
+                writer = CifWriter(
+                    structure,
+                    symprec=None,
+                    significant_figures=significant_figures,
+                )
+                writer.write_file(str(output_cif))
+            row["status"] = "written_p1_fallback"
+            row["n_sites_output"] = len(structure)
+            row["spacegroup_symbol"] = "P 1"
+            row["spacegroup_number"] = 1
+            row["message"] = f"symmetry conversion failed, wrote input structure without symmetry: {exc!r}"
+        except Exception as fallback_exc:
+            row["status"] = "failed"
+            row["message"] = f"{exc!r}; fallback write failed: {fallback_exc!r}"
+
+    return row
 
 
 def base_row(index: int, name: str, poscar: Path, work_dir: Path) -> dict[str, object]:
@@ -719,9 +902,76 @@ def collect_existing_result(index: int, poscar: Path, args, log_path: Path) -> d
     return row
 
 
+def collect_relaxed_cifs(args, log_path: Path) -> tuple[list[dict[str, object]], Path]:
+    relaxed_cif_dir = resolve_relaxed_cif_output_dir(args.output_dir, args.relaxed_cif_dir)
+    work_dirs = sorted(
+        path
+        for path in args.output_dir.iterdir()
+        if path.is_dir() and (path / "CalcFold").is_dir()
+    )
+    if not work_dirs:
+        raise FileNotFoundError(f"No CalcFold directories found in {args.output_dir}")
+
+    relaxed_cif_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, object]] = []
+
+    for work_dir in work_dirs:
+        source_cif = work_dir / "CalcFold" / "relaxed.cif"
+        output_cif = relaxed_cif_dir / f"{work_dir.name}.cif"
+
+        if not source_cif.exists():
+            row = {field: None for field in RELAXED_CIF_SUMMARY_FIELDS}
+            row.update(
+                {
+                    "calculation": work_dir.name,
+                    "status": "missing_relaxed_cif",
+                    "source_cif": str(source_cif),
+                    "output_cif": str(output_cif),
+                    "mode": args.relaxed_cif_mode,
+                    "message": "CalcFold/relaxed.cif does not exist",
+                }
+            )
+            rows.append(row)
+            log_message(log_path, f"[{work_dir.name}] missing relaxed.cif")
+            continue
+
+        row = rewrite_relaxed_cif_with_symmetry(
+            source_cif=source_cif,
+            output_cif=output_cif,
+            mode=args.relaxed_cif_mode,
+            symprec=args.relaxed_cif_symprec,
+            angle_tolerance=args.relaxed_cif_angle_tolerance,
+            significant_figures=args.relaxed_cif_significant_figures,
+        )
+        row["calculation"] = work_dir.name
+        rows.append(row)
+
+        sg = row.get("spacegroup_symbol") or "unknown"
+        status = row.get("status")
+        log_message(log_path, f"[{work_dir.name}] collected relaxed.cif as {output_cif.name} ({status}, {sg})")
+
+    return rows, relaxed_cif_dir
+
+
 def run_pipeline(args) -> int:
     args.input_dir = args.input_dir.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
+    if args.collect_relaxed_cifs and (args.collect_only or args.prepare_only):
+        raise ValueError("--collect-relaxed-cifs cannot be combined with --collect-only or --prepare-only.")
+
+    if args.collect_relaxed_cifs:
+        if not args.output_dir.is_dir():
+            raise NotADirectoryError(f"Output directory does not exist: {args.output_dir}")
+        log_path = args.output_dir / "dispatcher.log"
+        rows, relaxed_cif_dir = collect_relaxed_cifs(args, log_path)
+        csv_path, _ = write_relaxed_cif_summary(args.output_dir, rows)
+        written_count = sum(str(row.get("status", "")).startswith("written") for row in rows)
+        log_message(
+            log_path,
+            f"Collected {written_count}/{len(rows)} relaxed CIF files into {relaxed_cif_dir}; wrote summary to {csv_path}",
+        )
+        return 0
+
     if not args.input_dir.is_dir():
         raise NotADirectoryError(f"Input directory does not exist: {args.input_dir}")
 
