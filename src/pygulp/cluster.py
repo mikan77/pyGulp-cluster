@@ -322,7 +322,7 @@ def molecule_summary(atoms, tags: np.ndarray, local_connections_by_tag: dict[int
     return summary
 
 
-def render_gulp_input(atoms, keywords: str, options: str, library_name: str) -> str:
+def render_gulp_input(atoms, keywords: str, options: str, library_name: str | None = None) -> str:
     lines = [keywords.rstrip(), "title", "ASE calculation", "end", ""]
 
     if all(atoms.pbc):
@@ -342,7 +342,10 @@ def render_gulp_input(atoms, keywords: str, options: str, library_name: str) -> 
     for symbol, xyz, charge in zip(atoms.get_chemical_symbols(), coords, charges):
         lines.append(f" {symbol:<2} {xyz[0]:10.7f}  {xyz[1]:10.7f}  {xyz[2]:10.7f}  {charge:10.5f}")
 
-    lines.extend(["", f"library {library_name}", options.rstrip()])
+    lines.append("")
+    if library_name:
+        lines.append(f"library {library_name}")
+    lines.append(options.rstrip())
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -663,7 +666,7 @@ def prepare_structure(
     args,
     keywords: str,
     extra_options: str,
-    library_source: Path,
+    library_source: Path | None,
     log_path: Path,
 ) -> PreparedJob:
     name = f"{index:05d}_{sanitize_name(poscar.stem)}"
@@ -737,7 +740,7 @@ def prepare_structure(
         (work_dir / "options.in").write_text(extra_options + ("\n" if extra_options else ""))
         (work_dir / "generated_options.in").write_text(generated_options)
 
-        library_name = copy_selected_library(library_source, calc_dir)
+        library_name = copy_selected_library(library_source, calc_dir) if library_source is not None else None
         gin_text = render_gulp_input(atoms, keywords, generated_options, library_name)
         gin_path.write_text(gin_text)
 
@@ -1050,13 +1053,14 @@ def run_pipeline(args) -> int:
         log_message(log_path, f"Wrote summary to {csv_path}")
         return 0
 
-    if not args.library:
-        raise ValueError("--library is required unless --collect-only is used.")
-
     keywords = read_required_text_file(args.keywords_file, "keywords")
     extra_options = read_required_text_file(args.options_file, "options")
-    library_source, forcefield = resolve_library_source(args.library, runtime_directory())
-    log_message(log_path, f"Using {forcefield} library {library_source.name}")
+    library_source = None
+    if args.library:
+        library_source, forcefield = resolve_library_source(args.library, runtime_directory())
+        log_message(log_path, f"Using {forcefield} library {library_source.name}")
+    else:
+        log_message(log_path, "No --library supplied; GULP input will be generated without a library directive.")
 
     rows: list[dict[str, object]] = []
     prepared_jobs: list[PreparedJob] = []

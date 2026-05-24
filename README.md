@@ -27,7 +27,7 @@ For each input structure the program:
 
 ## Supported Force Fields
 
-The active force field is determined from the `--library` filename:
+When `--library` is supplied, the active force field is determined from the library filename:
 - `reaxff*.lib` -> `reaxff`
 - `gfnff*.lib` -> `gfnff`
 
@@ -57,7 +57,7 @@ You need:
 3. `options.in`
    This file contains the GULP options section placed after coordinates.
 
-4. A force-field library file passed through `--library`.
+4. Optional: a force-field library file passed through `--library`.
 
 5. `SLURM` tools available in the environment:
    - `sbatch`
@@ -68,7 +68,7 @@ You need:
 
 ## Where The `.lib` File Must Be
 
-For the binary workflow, the `.lib` file must be placed next to the binary.
+If `--library` is used in the binary workflow, the `.lib` file must be placed next to the binary.
 
 Example:
 
@@ -84,6 +84,9 @@ Then launch with:
 ```bash
 ./dist/pygulp-cluster /path/to/structures --library reaxff_general.lib
 ```
+
+If `--library` is omitted, no `.lib` file is copied and no `library ...` line is
+written to `ginput1.gin`.
 
 When running from source with `scripts/run_poscar_folder.py`, the program also
 accepts the library in the project root as a convenience for development.
@@ -257,7 +260,7 @@ For each structure:
         ├── ginput1.got
         ├── relaxed.cif
         ├── job.sh
-        ├── <selected_library>.lib
+        ├── <selected_library>.lib  # only when --library is supplied
         ├── slurm_<jobid>.out
         └── slurm_<jobid>.err
 ```
