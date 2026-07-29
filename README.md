@@ -15,15 +15,20 @@ cluster submission.
 ## What This Version Does
 
 For each input structure the program:
-- reads a POSCAR/VASP file, or any ASE-readable structure if `--format` is set
-- infers molecular components and generates GULP `connect` records
+- automatically reads CIF and POSCAR/VASP structures
+- determines symmetry with spglib, builds a conventional cell, validates its
+  asymmetric unit, and writes the detected space group to GULP
+- falls back to the full P1 structure when symmetry preparation is not reliable
+- infers molecular components and generates diagnostic GULP `connect` records
 - creates a working directory with `CalcFold`
 - writes `ginput1.gin`
 - writes `job.sh`
 - copies the selected `.lib` file into `CalcFold`
 - submits jobs through `sbatch`
 - keeps at most `N` simultaneously submitted jobs when `--max-parallel N` is used
-- writes `summary.csv` and `summary.jsonl`
+- writes `summary.csv`, `summary.jsonl`, and `summary.xlsx`
+- exports validated, Mercury-readable final CIF files as `relaxed_cifs/<ID>.cif`
+- counts molecules in the final expanded structure
 
 ## Supported Force Fields
 
@@ -50,6 +55,7 @@ You need:
    - `*POSCAR*`
    - `*.vasp`
    - `*.poscar`
+   - `*.cif`
 
 2. `keyword.in`
    This file contains the GULP keywords section placed before coordinates.
@@ -133,8 +139,11 @@ Use this file for:
 
 The program automatically appends:
 - `library <selected_library>`
-- generated `connect ...` lines unless `--no-connections` is used
+- generated `connect ...` lines for full P1 inputs unless `--no-connections` is used
 - `output movie cif relaxed.cif`
+
+Full-cell `connect` records are intentionally omitted when a reduced asymmetric
+unit is written because their atom indices do not address ASU sites.
 
 ## Job Script Handling
 
@@ -193,7 +202,9 @@ Defaults:
 - `--keywords-file keyword.in`
 - `--options-file options.in`
 - `--max-parallel 32`
-- `--format vasp`
+- `--format auto`
+- `--symprec 0.05`
+- symmetry preparation enabled
 
 ## Launch Examples
 
@@ -220,7 +231,6 @@ python3 scripts/run_poscar_folder.py /path/to/structures \
 ```bash
 python3 scripts/run_poscar_folder.py /path/to/cifs \
   --pattern '*.cif' \
-  --format cif \
   --library gfnff.lib \
   --max-parallel 16
 ```
@@ -249,6 +259,9 @@ For each structure:
 <output_dir>/
 └── 00001_structure_name/
     ├── input.cif
+    ├── standardized_full.cif
+    ├── asymmetric_unit.cif
+    ├── symmetry.json
     ├── keyword.in
     ├── options.in
     ├── generated_options.in
@@ -268,20 +281,30 @@ For each structure:
 In the output root:
 - `summary.csv`
 - `summary.jsonl`
+- `summary.xlsx`
+- `structure_manifest.json`
+- `relaxed_cifs/<ID>.cif`
 - `dispatcher.log`
 
 ## Summary Columns
 
 The compact summary contains:
-- `index`
+- `ID`
 - `name`
 - `status`
-- `poscar`
-- `work_dir`
-- `n_atoms`
 - `formula`
-- `n_molecules`
-- `molecule_formulas`
+- `n_atoms_input`
+- `n_atoms_conventional`
+- `n_atoms_asu`
+- `n_molecules_final`
+- `input_spacegroup`
+- `input_spacegroup_number`
+- `gulp_spacegroup`
+- `gulp_spacegroup_number`
+- `final_spacegroup`
+- `final_spacegroup_number`
+- `symmetry_operations`
+- `symmetry_fallback`
 - `energy_initial_ev`
 - `energy_final_ev`
 - `volume`
@@ -289,9 +312,11 @@ The compact summary contains:
 - `density_g_cm3`
 - `energy_initial_ev_per_atom`
 - `energy_final_ev_per_atom`
+- `cif_file`
+- `cif_status`
 
-Technical file paths such as `gin`, `got`, `job_script`, `submitted_job_id`,
-and similar service columns are intentionally not stored in the summary.
+Input paths and technical paths such as `gin`, `got`, `job_script`, and
+`submitted_job_id` are intentionally not stored in the summary.
 
 ## Building The Binary
 
@@ -342,9 +367,18 @@ or, after installation as a package:
 pygulp-cluster --help
 ```
 
+Run the symmetry/XLSX self-check with:
+
+```bash
+python3 scripts/check_cluster_symmetry.py
+```
+
 ## Notes
 
 - This build is cluster-oriented and assumes `SLURM`.
+- Symmetry is detected from the input and used for GULP by default. Use
+  `--no-symmetry` to keep the full input structure in P1.
+- `--collect-only` also rebuilds XLSX and the numbered final-CIF directory.
 - `gulp` itself is not bundled into the binary.
 - `.lib` files are not bundled into the binary.
 - If `ginput1.got` exists but the optimization did not converge, the final

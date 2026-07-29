@@ -8,7 +8,7 @@ from pathlib import Path
 
 def sort_key(row: dict[str, str]) -> tuple[int, str]:
     try:
-        return int(row.get("index", "0")), row.get("name", "")
+        return int(row.get("ID", "0")), row.get("name", "")
     except ValueError:
         return 0, row.get("name", "")
 
@@ -45,10 +45,15 @@ def main() -> None:
     with output.open("w", newline="") as fd:
         writer = csv.DictWriter(fd, fieldnames=fieldnames)
         writer.writeheader()
-        for row in sorted(rows, key=sort_key):
+        sorted_rows = sorted(rows, key=sort_key)
+        for row in sorted_rows:
             writer.writerow(row)
 
-    print(f"Merged {len(rows)} rows from {len(summary_files)} files into {output}")
+    import pandas as pd
+
+    xlsx_output = output.with_suffix(".xlsx")
+    pd.DataFrame(sorted_rows, columns=fieldnames).to_excel(xlsx_output, index=False, sheet_name="Summary")
+    print(f"Merged {len(rows)} rows from {len(summary_files)} files into {output} and {xlsx_output}")
 
 
 if __name__ == "__main__":
