@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_data_files
 
 
@@ -18,6 +20,14 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# Use the cluster's system libgcc_s; the Conda copy may require a newer glibc.
+a.binaries = [
+    item
+    for item in a.binaries
+    if item[0] != 'libgcc_s.so.1' and Path(item[1]).name != 'libgcc_s.so.1'
+]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
