@@ -14,6 +14,7 @@ class StageSpec:
     name: str
     keywords: str
     options: str
+    require_convergence: bool = True
 
     @property
     def prefix(self) -> str:
@@ -29,6 +30,8 @@ STAGE_RESULT_FIELDS = (
     "stage",
     "name",
     "status",
+    "gulp_status",
+    "converged",
     "energy_initial_ev",
     "energy_final_ev",
     "volume",
@@ -70,16 +73,26 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
         raw_name = entry.get("name")
         keywords = entry.get("keywords")
         options = entry.get("options", default_options)
+        require_convergence = entry.get("require_convergence", True)
         if not isinstance(raw_name, str) or not isinstance(keywords, str) or not keywords.strip():
             raise ValueError(f"Stage #{index} requires non-empty string fields 'name' and 'keywords'")
         if not isinstance(options, str):
             raise ValueError(f"Stage #{index} field 'options' must be a string")
+        if not isinstance(require_convergence, bool):
+            raise ValueError(f"Stage #{index} field 'require_convergence' must be true or false")
         cleaned_name = sanitize_stage_name(raw_name)
         if cleaned_name in used_names:
             raise ValueError(f"Duplicate stage name: {raw_name}")
         used_names.add(cleaned_name)
         name = f"{index:02d}_{cleaned_name}"
-        stages.append(StageSpec(name=name, keywords=keywords.rstrip(), options=options.rstrip()))
+        stages.append(
+            StageSpec(
+                name=name,
+                keywords=keywords.rstrip(),
+                options=options.rstrip(),
+                require_convergence=require_convergence,
+            )
+        )
 
     for stage in stages[:-1]:
         if not stage.is_optimisation:
@@ -255,15 +268,18 @@ def execute_stage_plan(plan_path: Path) -> int:
             validate_got_contract(data, expected_asu, expected_total)
             if completed.returncode != 0:
                 raise RuntimeError(f"GULP command returned exit code {completed.returncode}")
-            if bool(stage["is_optimisation"]):
-                if data.get("gulp_status") != "optimisation_achieved":
-                    raise RuntimeError(str(data.get("gulp_status") or "optimisation did not finish normally"))
-            elif not data.get("completed_normally"):
+            if not data.get("completed_normally"):
                 raise RuntimeError("GULP did not report normal completion")
+            converged = not bool(stage["is_optimisation"]) or data.get("gulp_status") == "optimisation_achieved"
+            row["converged"] = converged
+            if bool(stage["is_optimisation"]) and bool(stage.get("require_convergence", True)) and not converged:
+                raise RuntimeError(str(data.get("gulp_status") or "optimisation did not converge"))
             if stage.get("needs_restart") and not restart_path.exists():
                 raise FileNotFoundError(f"GULP did not write restart file {restart_path.name}")
 
-            row["status"] = "success"
+            row["status"] = "success" if converged else "completed_nonconverged"
+            if not converged:
+                row["message"] = f"accepted without convergence: {data.get('gulp_status') or 'not reported'}"
             if cif_path.exists():
                 last_cif = cif_path
             write_stage_results(calc_dir, results)

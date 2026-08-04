@@ -1,5 +1,6 @@
 stages:
   - name: fixed_cell
+    require_convergence: false
     keywords: |
       opti conj reaxff conv qiter spat
       parallel better_scaling
@@ -11,6 +12,7 @@ stages:
       stepmx 0.05
 
   - name: variable_cell
+    require_convergence: false
     keywords: |
       opti conj reaxff conp qiter spat
       parallel better_scaling

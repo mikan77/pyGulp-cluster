@@ -69,7 +69,7 @@ dump old.grs
             "    'Number of irreducible atoms/shells = 1\\n'\n"
             "    'Total number atoms/shells = 1\\n'\n"
             "    'Total lattice energy = -1.0 eV\\n'\n"
-            "    + ('' if 'static' in prefix else 'Optimisation achieved\\n')\n"
+            "    + ('' if 'static' in prefix else 'Maximum number of function calls has been reached\\n')\n"
             "    + 'GULP has completed\\n'\n"
             ")\n"
             "Path(prefix + '.cif').write_text('data_test\\n')\n"
@@ -86,6 +86,7 @@ dump old.grs
                 "keywords": "opti conj reaxff conv",
                 "options": "maxcyc 100",
                 "is_optimisation": True,
+                "require_convergence": False,
                 "needs_restart": True,
             },
             {
@@ -94,6 +95,7 @@ dump old.grs
                 "keywords": "opti conj reaxff conp",
                 "options": "maxcyc 100",
                 "is_optimisation": True,
+                "require_convergence": False,
                 "needs_restart": True,
             },
             {
@@ -115,7 +117,11 @@ dump old.grs
         plan_path.write_text(json.dumps(plan))
         assert execute_stage_plan(plan_path) == 0
         results = json.loads((calc_dir / "stage_results.json").read_text())
-        assert [item["status"] for item in results] == ["success", "success", "success"]
+        assert [item["status"] for item in results] == [
+            "completed_nonconverged",
+            "completed_nonconverged",
+            "success",
+        ]
         assert "conp" in (calc_dir / "02_variable.gin").read_text()
         assert "single" in (calc_dir / "03_static.gin").read_text()
         assert (calc_dir / "ginput1.got").exists() and (calc_dir / "relaxed.cif").exists()

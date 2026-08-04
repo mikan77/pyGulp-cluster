@@ -166,16 +166,17 @@ The included profile performs:
 3. an optional final single-point calculation
 
 Each non-final stage must be an optimisation. GULP passes its updated geometry
-and cell to the next stage through a native `.grs` restart file. The next stage
-is not started unless the previous one reports `Optimisation achieved`, writes
-the expected restart, and preserves the expected irreducible and total atom
-counts.
+and cell to the next stage through a native `.grs` restart file. By default the
+next stage requires `Optimisation achieved`; set `require_convergence: false`
+when a normally completed GULP run may continue after `max_function_calls`.
+The expected restart and irreducible/total atom counts are always required.
 
 Example configuration:
 
 ```yaml
 stages:
   - name: fixed_cell
+    require_convergence: false
     keywords: |
       opti conj reaxff conv qiter spat
     options: |
@@ -184,6 +185,7 @@ stages:
       stepmx 0.05
 
   - name: variable_cell
+    require_convergence: false
     keywords: |
       opti conj reaxff conp qiter spat
     options: |

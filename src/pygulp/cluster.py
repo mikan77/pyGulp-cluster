@@ -641,6 +641,7 @@ def build_stage_plan(
                 "keywords": stage.keywords,
                 "options": stage_options,
                 "is_optimisation": stage.is_optimisation,
+                "require_convergence": stage.require_convergence,
                 "needs_restart": index < len(stages) - 1,
             }
         )
@@ -686,7 +687,9 @@ def apply_stage_results(row: dict[str, object], calc_dir: Path) -> bool:
         row["total_stages"] = len(json.loads(plan_path.read_text()).get("stages", results))
     else:
         row["total_stages"] = len(results)
-    row["completed_stages"] = sum(item.get("status") == "success" for item in results)
+    row["completed_stages"] = sum(
+        item.get("status") in {"success", "completed_nonconverged"} for item in results
+    )
     failed = next((item for item in results if item.get("status") == "failed"), None)
     row["failed_stage"] = failed.get("name") if failed else None
     if failed:
