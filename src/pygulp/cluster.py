@@ -5,6 +5,7 @@ import csv
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,14 @@ from pygulp.molecule.connections import (
     infer_molecule_tags_natural_cutoffs,
     infer_natural_cutoff_connections,
     write_connections,
+)
+from pygulp.stages import (
+    STAGE_RESULT_FIELDS,
+    StageSpec,
+    execute_stage_plan,
+    load_stage_specs,
+    parse_got,
+    validate_got_contract,
 )
 
 
@@ -53,6 +62,9 @@ SUMMARY_FIELDS = (
     "energy_final_ev_per_atom",
     "cif_file",
     "cif_status",
+    "completed_stages",
+    "total_stages",
+    "failed_stage",
 )
 RELAXED_CIF_SUMMARY_FIELDS = (
     "calculation",
@@ -85,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Prepare and submit symmetry-aware GULP SLURM jobs from CIF/POSCAR files."
     )
-    parser.add_argument("input_dir", type=Path, help="Directory containing CIF/POSCAR files.")
+    parser.add_argument("input_dir", type=Path, nargs="?", help="Directory containing CIF/POSCAR files.")
     parser.add_argument("-o", "--output-dir", type=Path, default=Path("pygulp_runs"), help="Output directory.")
     parser.add_argument("-r", "--recursive", action="store_true", help="Search subdirectories recursively.")
     parser.add_argument("--pattern", action="append", default=None, help="Glob pattern. Can be passed multiple times.")
@@ -96,6 +108,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--library", default=None, help="Force-field library file stored next to the binary, e.g. reaxff_general.lib.")
     parser.add_argument("--keywords-file", default="keyword.in", help="File with GULP keywords.")
     parser.add_argument("--options-file", default="options.in", help="File with GULP options placed after coordinates.")
+    parser.add_argument("--stages-file", type=Path, default=None, help="YAML file describing sequential GULP stages.")
+    parser.add_argument("--force", action="store_true", help="Allow existing calculation results to be overwritten.")
+    parser.add_argument("--execute-stage-plan", type=Path, default=None, help=argparse.SUPPRESS)
 
     parser.add_argument("--prepare-only", action="store_true", help="Only generate CalcFold inputs and job scripts.")
     parser.add_argument("--collect-only", action="store_true", help="Rebuild summary tables from existing work directories.")
@@ -188,13 +203,20 @@ def log_message(log_path: Path, message: str) -> None:
         fd.write(stamped + "\n")
 
 
-def collect_structures(input_dir: Path, recursive: bool, patterns: tuple[str, ...]) -> list[Path]:
+def collect_structures(
+    input_dir: Path,
+    recursive: bool,
+    patterns: tuple[str, ...],
+    excluded_dir: Path | None = None,
+) -> list[Path]:
     paths: set[Path] = set()
+    excluded_dir = excluded_dir.resolve() if excluded_dir is not None else None
     for pattern in patterns:
         iterator = input_dir.rglob(pattern) if recursive else input_dir.glob(pattern)
         for path in iterator:
-            if path.is_file():
-                paths.add(path.resolve())
+            resolved = path.resolve()
+            if path.is_file() and (excluded_dir is None or not resolved.is_relative_to(excluded_dir)):
+                paths.add(resolved)
     return sorted(paths)
 
 
@@ -352,6 +374,8 @@ def prepare_symmetry(atoms: Atoms, symprec: float, disabled: bool = False) -> tu
                 "symmetry_fallback": False,
             }
         )
+        if int(dataset.number) == 1 and len(asu) != len(conventional):
+            raise ValueError("P1 input must contain the complete conventional structure")
         return conventional, asu, metadata
     except Exception as exc:
         metadata["symmetry_fallback"] = True
@@ -413,67 +437,21 @@ def resolve_library_source(library: str, runtime_dir: Path) -> tuple[Path, str]:
     return library_path, forcefield
 
 
-def build_options(connections_text: str, extra_options: str) -> str:
+def build_options(
+    connections_text: str,
+    extra_options: str,
+    output_cif: str = "relaxed.cif",
+    restart_file: str | None = None,
+) -> str:
     lines: list[str] = []
     if extra_options:
         lines.append(extra_options.rstrip())
     if connections_text:
         lines.append(connections_text.rstrip())
-    lines.append("output movie cif relaxed.cif")
+    lines.append(f"output movie cif {output_cif}")
+    if restart_file:
+        lines.append(f"dump {restart_file}")
     return "\n".join(lines).rstrip() + "\n"
-
-
-def parse_got(got_path: Path) -> dict[str, object]:
-    data: dict[str, object] = {
-        "energy_initial_ev": None,
-        "energy_final_ev": None,
-        "volume": None,
-        "runtime_seconds": None,
-        "gulp_status": None,
-    }
-    if not got_path.exists():
-        return data
-
-    energies: list[float] = []
-    volumes: list[str] = []
-    runtime_seconds: float | None = None
-    cpu_seconds: float | None = None
-
-    for line in got_path.read_text(errors="replace").splitlines():
-        energy_match = re.search(r"Total lattice energy\s*=\s*([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)\s*eV", line)
-        if energy_match:
-            energies.append(float(energy_match.group(1)))
-
-        volume_match = re.search(r"cell volume\s*=\s*([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)", line, re.I)
-        if volume_match:
-            volumes.append(volume_match.group(1))
-
-        runtime_match = re.search(
-            r"Time to end of optimisation\s*=\s*([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)\s*seconds",
-            line,
-            re.I,
-        )
-        if runtime_match:
-            runtime_seconds = float(runtime_match.group(1))
-
-        cpu_match = re.search(r"Total CPU time\s+([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)", line)
-        if cpu_match:
-            cpu_seconds = float(cpu_match.group(1))
-
-        if "Optimisation achieved" in line:
-            data["gulp_status"] = "optimisation_achieved"
-        elif "Maximum number of function calls has been reached" in line:
-            data["gulp_status"] = "max_function_calls"
-        elif "Too many failed attempts to optimise" in line:
-            data["gulp_status"] = "too_many_failed_attempts"
-
-    if energies:
-        data["energy_initial_ev"] = energies[0]
-        data["energy_final_ev"] = energies[-1]
-    if volumes:
-        data["volume"] = volumes[-1]
-    data["runtime_seconds"] = runtime_seconds if runtime_seconds is not None else cpu_seconds
-    return data
 
 
 def molecule_summary(atoms, tags: np.ndarray, local_connections_by_tag: dict[int, list[tuple[int, int]]]) -> list[dict]:
@@ -527,20 +505,60 @@ def render_gulp_input(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def gulp_run_line(args) -> str:
+def validate_gin_contract(gin_text: str, expected_asu: int, expected_spacegroup: int) -> None:
+    lines = gin_text.splitlines()
+    coordinate_start = next(
+        (index + 1 for index, line in enumerate(lines) if line.strip().lower() in {"frac", "cart"}),
+        None,
+    )
+    if coordinate_start is None:
+        raise ValueError("Generated GULP input has no frac/cart coordinate block")
+    spacegroup_index = next(
+        (index for index, line in enumerate(lines[coordinate_start:], coordinate_start) if line.strip().lower() == "spacegroup"),
+        None,
+    )
+    if spacegroup_index is None:
+        raise ValueError("Generated GULP input has no spacegroup block")
+    coordinate_count = sum(bool(line.strip()) for line in lines[coordinate_start:spacegroup_index])
+    spacegroup_value = next((line.strip() for line in lines[spacegroup_index + 1 :] if line.strip()), None)
+    if coordinate_count != expected_asu or spacegroup_value != str(expected_spacegroup):
+        raise ValueError(
+            "Generated GULP input violates symmetry contract: "
+            f"coordinates={coordinate_count} (expected {expected_asu}), "
+            f"spacegroup={spacegroup_value} (expected {expected_spacegroup})"
+        )
+
+
+def gulp_run_line(args, prefix: str = "ginput1") -> str:
     if args.gulp_command:
-        return args.gulp_command.replace("PREFIX", "ginput1")
-    return f'"{args.gulp_exe}" < ginput1.gin > ginput1.got'
+        return args.gulp_command.replace("PREFIX", prefix)
+    return f'"{args.gulp_exe}" < {prefix}.gin > {prefix}.got'
 
 
-def render_job_script(job_name: str, calc_dir: Path, args) -> str:
+def stage_gulp_command(args) -> str:
+    if args.gulp_command:
+        if "PREFIX" not in args.gulp_command:
+            raise ValueError("--gulp-command must contain PREFIX in multi-stage mode")
+        return args.gulp_command
+
+    template_path = Path(args.job_template).expanduser()
+    if template_path.exists():
+        for line in template_path.read_text().splitlines():
+            if re.search(r"\bgulp\b.*<.*ginput1\.gin.*>.*ginput1\.got", line) and not line.lstrip().startswith("#"):
+                return line.strip().replace("ginput1", "PREFIX")
+    return f'"{args.gulp_exe}" < PREFIX.gin > PREFIX.got'
+
+
+def render_job_script(job_name: str, calc_dir: Path, args, run_line: str | None = None) -> str:
+    has_custom_run_line = run_line is not None
+    run_line = run_line or gulp_run_line(args)
     context = {
         "job_name": job_name[:80],
         "calc_dir": str(calc_dir),
         "gulp_exe": args.gulp_exe,
         "gin": "ginput1.gin",
         "got": "ginput1.got",
-        "gulp_run_line": gulp_run_line(args),
+        "gulp_run_line": run_line,
     }
 
     template_path = Path(args.job_template).expanduser()
@@ -549,15 +567,21 @@ def render_job_script(job_name: str, calc_dir: Path, args) -> str:
         rendered = Template(template_text).safe_substitute(context)
         lines = []
         replaced_job_name = False
+        replaced_run_line = not has_custom_run_line or "$gulp_run_line" in template_text or "${gulp_run_line}" in template_text
         for line in rendered.splitlines():
             if re.match(r"^\s*#SBATCH\s+(--job-name(?:=|\s+)|-J\s+)", line):
                 lines.append(f"#SBATCH --job-name={context['job_name']}")
                 replaced_job_name = True
+            elif has_custom_run_line and re.search(r"\bgulp\b.*<.*\.gin.*>.*\.got", line):
+                lines.append(run_line)
+                replaced_run_line = True
             else:
                 lines.append(line)
         if not replaced_job_name:
             insert_at = 1 if lines and lines[0].startswith("#!") else 0
             lines.insert(insert_at, f"#SBATCH --job-name={context['job_name']}")
+        if not replaced_run_line:
+            lines.append(run_line)
         return "\n".join(lines).rstrip() + "\n"
 
     sbatch_lines = [
@@ -581,6 +605,121 @@ def render_job_script(job_name: str, calc_dir: Path, args) -> str:
         body.append(line)
     body.extend([f'cd "{calc_dir}"', context["gulp_run_line"]])
     return "\n".join(sbatch_lines + body) + "\n"
+
+
+def stage_runner_line(plan_path: Path) -> str:
+    if getattr(sys, "frozen", False):
+        command = [str(Path(sys.executable).resolve())]
+    else:
+        launcher = Path(sys.argv[0]).resolve()
+        if launcher.exists() and launcher.suffix == ".py":
+            command = [sys.executable, str(launcher)]
+        else:
+            command = [sys.executable, "-m", "pygulp.cli"]
+    command.extend(["--execute-stage-plan", plan_path.name])
+    return " ".join(shlex.quote(item) for item in command)
+
+
+def build_stage_plan(
+    stages: list[StageSpec],
+    asu_atoms,
+    connections_text: str,
+    library_name: str | None,
+    spacegroup_number: int,
+    n_atoms_conventional: int,
+    calc_dir: Path,
+    args,
+) -> tuple[Path, Path]:
+    stage_payloads: list[dict[str, object]] = []
+    for index, stage in enumerate(stages):
+        options_parts = [part for part in (stage.options.rstrip(), connections_text.rstrip()) if part]
+        stage_options = "\n".join(options_parts)
+        stage_payloads.append(
+            {
+                "name": stage.name,
+                "prefix": stage.prefix,
+                "keywords": stage.keywords,
+                "options": stage_options,
+                "is_optimisation": stage.is_optimisation,
+                "needs_restart": index < len(stages) - 1,
+            }
+        )
+
+    first = stage_payloads[0]
+    first_options = build_options(
+        connections_text=connections_text,
+        extra_options=stages[0].options,
+        output_cif=f"{first['prefix']}.cif",
+        restart_file=f"{first['prefix']}.grs" if first["needs_restart"] else None,
+    )
+    first_gin = render_gulp_input(
+        asu_atoms,
+        stages[0].keywords,
+        first_options,
+        library_name,
+        spacegroup_number=spacegroup_number,
+    )
+    validate_gin_contract(first_gin, len(asu_atoms), spacegroup_number)
+    first_gin_path = calc_dir / f"{first['prefix']}.gin"
+    first_gin_path.write_text(first_gin)
+    (calc_dir / "ginput1.gin").write_text(first_gin)
+
+    plan = {
+        "n_atoms_asu": len(asu_atoms),
+        "n_atoms_conventional": n_atoms_conventional,
+        "spacegroup_number": spacegroup_number,
+        "gulp_command": stage_gulp_command(args),
+        "stages": stage_payloads,
+    }
+    plan_path = calc_dir / "stage_plan.json"
+    plan_path.write_text(json.dumps(plan, indent=2) + "\n")
+    return plan_path, first_gin_path
+
+
+def apply_stage_results(row: dict[str, object], calc_dir: Path) -> bool:
+    result_path = calc_dir / "stage_results.json"
+    if not result_path.exists():
+        return False
+    results = json.loads(result_path.read_text())
+    plan_path = calc_dir / "stage_plan.json"
+    if plan_path.exists():
+        row["total_stages"] = len(json.loads(plan_path.read_text()).get("stages", results))
+    else:
+        row["total_stages"] = len(results)
+    row["completed_stages"] = sum(item.get("status") == "success" for item in results)
+    failed = next((item for item in results if item.get("status") == "failed"), None)
+    row["failed_stage"] = failed.get("name") if failed else None
+    if failed:
+        row["status"] = f"stage_failed:{failed.get('name')}"
+    elif (
+        results
+        and row["completed_stages"] == row["total_stages"]
+        and row.get("status") in {"started", "prepared", "submitted", "missing", "unknown", "completed_without_output"}
+    ):
+        row["status"] = "success"
+    return True
+
+
+def write_global_stage_summary(output_dir: Path) -> Path | None:
+    rows: list[dict[str, object]] = []
+    for work_dir in sorted(output_dir.glob("[0-9]*_*")):
+        result_path = work_dir / "CalcFold" / "stage_results.json"
+        if not result_path.exists():
+            continue
+        identifier_match = re.match(r"^(\d+)_", work_dir.name)
+        identifier = int(identifier_match.group(1)) if identifier_match else work_dir.name
+        for stage in json.loads(result_path.read_text()):
+            rows.append({"ID": identifier, "calculation": work_dir.name, **stage})
+    if not rows:
+        return None
+    fields = ("ID", "calculation", *STAGE_RESULT_FIELDS)
+    output_path = output_dir / "stages.csv"
+    with output_path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fields})
+    return output_path
 
 
 def write_summary(output_dir: Path, rows: list[dict[str, object]], basename: str = "summary") -> tuple[Path, Path]:
@@ -795,6 +934,10 @@ def enrich_row_from_outputs(
     angle_tolerance: float = 5.0,
 ) -> dict[str, object]:
     got_data = parse_got(got_path)
+    expected_asu = row.get("n_atoms_asu")
+    expected_total = row.get("n_atoms_conventional")
+    if isinstance(expected_asu, int) and isinstance(expected_total, int):
+        validate_got_contract(got_data, expected_asu, expected_total)
     row["energy_initial_ev"] = got_data["energy_initial_ev"]
     row["energy_final_ev"] = got_data["energy_final_ev"]
     row["volume"] = got_data["volume"]
@@ -903,6 +1046,7 @@ def prepare_structure(
     extra_options: str,
     library_source: Path | None,
     log_path: Path,
+    stages: list[StageSpec] | None = None,
 ) -> PreparedJob:
     name = f"{index:05d}_{sanitize_name(poscar.stem)}"
     work_dir = args.output_dir / name
@@ -917,8 +1061,35 @@ def prepare_structure(
     try:
         work_dir.mkdir(parents=True, exist_ok=True)
         calc_dir.mkdir(parents=True, exist_ok=True)
+        existing_results = [
+            path
+            for path in (got_path, relaxed_cif_path, calc_dir / "stage_results.json")
+            if path.exists()
+        ]
+        if existing_results and not args.force:
+            log_message(
+                log_path,
+                f"[{index}] existing results preserved; use --force to overwrite: "
+                + ", ".join(path.name for path in existing_results),
+            )
+            existing_row = collect_existing_result(index, poscar, args, log_path)
+            return PreparedJob(
+                index=index,
+                poscar=poscar,
+                work_dir=work_dir,
+                calc_dir=calc_dir,
+                gin_path=gin_path,
+                got_path=got_path,
+                input_cif_path=input_cif_path,
+                relaxed_cif_path=relaxed_cif_path,
+                job_script_path=None,
+                row=existing_row,
+            )
         for stale_file in (got_path, relaxed_cif_path, calc_dir / "opt_step"):
             if stale_file.exists() and stale_file.is_file():
+                stale_file.unlink()
+        for stale_file in (calc_dir / "stage_results.json", calc_dir / "stages.csv"):
+            if stale_file.exists():
                 stale_file.unlink()
 
         input_atoms = read_structure(poscar, args.format)
@@ -940,7 +1111,7 @@ def prepare_structure(
         row["_total_mass_amu"] = float(atoms.get_masses().sum())
 
         write(work_dir / "standardized_full.cif", atoms)
-        write(work_dir / "asymmetric_unit.cif", asu_atoms)
+        write(work_dir / "asymmetric_unit.xyz", asu_atoms)
         symmetry_payload = {
             **{key: value for key, value in symmetry.items() if not key.startswith("_")},
             "n_atoms_input": len(input_atoms),
@@ -999,17 +1170,37 @@ def prepare_structure(
         (work_dir / "generated_options.in").write_text(generated_options)
 
         library_name = copy_selected_library(library_source, calc_dir) if library_source is not None else None
-        gin_text = render_gulp_input(
-            asu_atoms,
-            keywords,
-            generated_options,
-            library_name,
-            spacegroup_number=int(row["gulp_spacegroup_number"] or 1),
-        )
-        gin_path.write_text(gin_text)
+        spacegroup_number = int(row["gulp_spacegroup_number"] or 1)
+        if stages:
+            if args.stages_file is not None:
+                shutil.copy2(args.stages_file, work_dir / "stages.yaml")
+            plan_path, _ = build_stage_plan(
+                stages=stages,
+                asu_atoms=asu_atoms,
+                connections_text=connections_text,
+                library_name=library_name,
+                spacegroup_number=spacegroup_number,
+                n_atoms_conventional=len(atoms),
+                calc_dir=calc_dir,
+                args=args,
+            )
+            run_line = stage_runner_line(plan_path)
+            row["total_stages"] = len(stages)
+            row["completed_stages"] = 0
+        else:
+            gin_text = render_gulp_input(
+                asu_atoms,
+                keywords,
+                generated_options,
+                library_name,
+                spacegroup_number=spacegroup_number,
+            )
+            validate_gin_contract(gin_text, len(asu_atoms), spacegroup_number)
+            gin_path.write_text(gin_text)
+            run_line = None
 
         job_script_path = calc_dir / args.job_script_name
-        job_script_path.write_text(render_job_script(name, calc_dir, args))
+        job_script_path.write_text(render_job_script(name, calc_dir, args, run_line=run_line))
         job_script_path.chmod(0o755)
 
         row["status"] = "prepared"
@@ -1156,14 +1347,18 @@ def wait_for_jobs(
             job = active.pop(job_id)
             slurm_state = final_states.get(job_id, "UNKNOWN")
             try:
-                got_data = enrich_row_from_outputs(
-                    row=job.row,
-                    got_path=job.got_path,
-                    relaxed_cif_path=job.relaxed_cif_path,
-                    symprec=args.symprec,
-                    angle_tolerance=args.relaxed_cif_angle_tolerance,
-                )
-                job.row["status"] = determine_final_status(slurm_state, got_data, job.relaxed_cif_path)
+                has_stage_results = apply_stage_results(job.row, job.calc_dir)
+                if not (has_stage_results and job.row.get("failed_stage")):
+                    got_data = enrich_row_from_outputs(
+                        row=job.row,
+                        got_path=job.got_path,
+                        relaxed_cif_path=job.relaxed_cif_path,
+                        symprec=args.symprec,
+                        angle_tolerance=args.relaxed_cif_angle_tolerance,
+                    )
+                    job.row["status"] = determine_final_status(slurm_state, got_data, job.relaxed_cif_path)
+                    if has_stage_results:
+                        apply_stage_results(job.row, job.calc_dir)
             except Exception as exc:
                 job.row["status"] = "postprocess_failed"
                 log_message(log_path, f"[{job.index}] postprocess failed for job {job_id}: {exc!r}")
@@ -1217,6 +1412,8 @@ def collect_existing_result(index: int, poscar: Path, args, log_path: Path) -> d
             log_message(log_path, f"[{index}] collect failed for {poscar}: {exc!r}")
     elif gin_path.exists():
         row["status"] = "prepared"
+
+    apply_stage_results(row, calc_dir)
 
     return row
 
@@ -1275,8 +1472,14 @@ def collect_relaxed_cifs(args, log_path: Path) -> tuple[list[dict[str, object]],
 
 
 def run_pipeline(args) -> int:
+    if args.input_dir is None:
+        raise ValueError("input_dir is required unless --execute-stage-plan is used")
     args.input_dir = args.input_dir.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
+    if args.stages_file is not None:
+        args.stages_file = args.stages_file.expanduser().resolve()
+        if not args.stages_file.is_file():
+            raise FileNotFoundError(f"Stages file not found: {args.stages_file}")
     if args.collect_relaxed_cifs and (args.collect_only or args.prepare_only):
         raise ValueError("--collect-relaxed-cifs cannot be combined with --collect-only or --prepare-only.")
 
@@ -1300,7 +1503,8 @@ def run_pipeline(args) -> int:
     log_path = args.output_dir / "dispatcher.log"
 
     patterns = tuple(args.pattern) if args.pattern else DEFAULT_PATTERNS
-    poscars = collect_structures(args.input_dir, args.recursive, patterns)
+    excluded_dir = args.output_dir if args.output_dir.is_relative_to(args.input_dir) else None
+    poscars = collect_structures(args.input_dir, args.recursive, patterns, excluded_dir=excluded_dir)
     if args.limit is not None:
         poscars = poscars[: args.limit]
     if not poscars:
@@ -1317,12 +1521,18 @@ def run_pipeline(args) -> int:
     if args.collect_only:
         rows = [collect_existing_result(index, poscar, args, log_path) for index, poscar in indexed_poscars]
         export_final_cifs(rows, args, log_path)
+        write_global_stage_summary(args.output_dir)
         csv_path, _ = write_summary(args.output_dir, rows, summary_basename)
         log_message(log_path, f"Wrote summary to {csv_path}")
         return 0
 
-    keywords = read_required_text_file(args.keywords_file, "keywords")
-    extra_options = read_required_text_file(args.options_file, "options")
+    options_path = Path(args.options_file).expanduser()
+    if args.stages_file is not None and not options_path.exists():
+        extra_options = ""
+    else:
+        extra_options = read_required_text_file(args.options_file, "options")
+    stages = load_stage_specs(args.stages_file, extra_options) if args.stages_file is not None else None
+    keywords = stages[0].keywords if stages else read_required_text_file(args.keywords_file, "keywords")
     library_source = None
     if args.library:
         library_source, forcefield = resolve_library_source(args.library, runtime_directory())
@@ -1334,7 +1544,7 @@ def run_pipeline(args) -> int:
     prepared_jobs: list[PreparedJob] = []
     for index, poscar in indexed_poscars:
         log_message(log_path, f"[ID {index}] preparing {poscar}")
-        prepared = prepare_structure(index, poscar, args, keywords, extra_options, library_source, log_path)
+        prepared = prepare_structure(index, poscar, args, keywords, extra_options, library_source, log_path, stages=stages)
         rows.append(prepared.row)
         if prepared.job_script_path is not None and prepared.row["status"] == "prepared":
             prepared_jobs.append(prepared)
@@ -1347,6 +1557,7 @@ def run_pipeline(args) -> int:
 
     if prepared_jobs:
         wait_for_jobs(prepared_jobs, rows, args, summary_basename, log_path)
+    write_global_stage_summary(args.output_dir)
     export_final_cifs(rows, args, log_path)
     csv_path, _ = write_summary(args.output_dir, rows, summary_basename)
     log_message(log_path, f"Wrote summary to {csv_path}")
@@ -1356,4 +1567,6 @@ def run_pipeline(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.execute_stage_plan is not None:
+        return execute_stage_plan(args.execute_stage_plan)
     return run_pipeline(args)

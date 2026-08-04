@@ -1,0 +1,27 @@
+stages:
+  - name: fixed_cell
+    keywords: |
+      opti conj reaxff conv qiter spat
+      parallel better_scaling
+    options: |
+      ftol 1e-5
+      gtol 1e-3
+      xtol 1e-5
+      maxcyc 500
+      stepmx 0.05
+
+  - name: variable_cell
+    keywords: |
+      opti conj reaxff conp qiter spat
+      parallel better_scaling
+    options: |
+      ftol 1e-5
+      gtol 5e-4
+      xtol 1e-5
+      maxcyc 1000
+      stepmx 0.02
+
+  - name: static
+    keywords: |
+      single reaxff qiter spat
+      parallel better_scaling

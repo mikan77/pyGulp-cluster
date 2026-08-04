@@ -23,6 +23,7 @@ For each input structure the program:
 - creates a working directory with `CalcFold`
 - writes `ginput1.gin`
 - writes `job.sh`
+- optionally runs several GULP stages sequentially under one SLURM job ID
 - copies the selected `.lib` file into `CalcFold`
 - submits jobs through `sbatch`
 - keeps at most `N` simultaneously submitted jobs when `--max-parallel N` is used
@@ -57,10 +58,10 @@ You need:
    - `*.poscar`
    - `*.cif`
 
-2. `keyword.in`
+2. `keyword.in` for the default single-stage mode.
    This file contains the GULP keywords section placed before coordinates.
 
-3. `options.in`
+3. `options.in` for the default single-stage mode.
    This file contains the GULP options section placed after coordinates.
 
 4. Optional: a force-field library file passed through `--library`.
@@ -71,6 +72,9 @@ You need:
    - `sacct`
 
 6. `gulp` available on the compute nodes through your job script environment.
+
+For multi-stage mode, `--stages-file` replaces `keyword.in`. `options.in` is
+only used as the default for stages that omit their own `options` field.
 
 ## Where The `.lib` File Must Be
 
@@ -145,6 +149,51 @@ The program automatically appends:
 Full-cell `connect` records are intentionally omitted when a reduced asymmetric
 unit is written because their atom indices do not address ASU sites.
 
+## Multi-Stage Mode
+
+Pass a YAML file to run several calculations sequentially under one SLURM job ID:
+
+```bash
+pygulp-cluster /path/to/structures \
+  --stages-file configs/stages_relax_static.yaml \
+  --library reaxff_general.lib
+```
+
+The included profile performs:
+
+1. atomic relaxation with a fixed cell (`conv`)
+2. atomic and cell relaxation (`conp`)
+3. an optional final single-point calculation
+
+Each non-final stage must be an optimisation. GULP passes its updated geometry
+and cell to the next stage through a native `.grs` restart file. The next stage
+is not started unless the previous one reports `Optimisation achieved`, writes
+the expected restart, and preserves the expected irreducible and total atom
+counts.
+
+Example configuration:
+
+```yaml
+stages:
+  - name: fixed_cell
+    keywords: |
+      opti conj reaxff conv qiter spat
+    options: |
+      gtol 1e-3
+      maxcyc 500
+      stepmx 0.05
+
+  - name: variable_cell
+    keywords: |
+      opti conj reaxff conp qiter spat
+    options: |
+      gtol 5e-4
+      maxcyc 1000
+      stepmx 0.02
+```
+
+Without `--stages-file`, the original single-stage workflow is unchanged.
+
 ## Job Script Handling
 
 If a `job.sh` file exists at the path passed to `--job-template` or in the
@@ -158,6 +207,9 @@ The generated script always gets a per-structure job name and runs:
 ```bash
 gulp < ginput1.gin > ginput1.got
 ```
+
+In multi-stage mode this command is replaced with the internal stage runner.
+SBATCH settings, module commands, `ulimit`, and other template lines are retained.
 
 You can also customize:
 - `--job-time`
@@ -193,6 +245,8 @@ Main arguments:
 - `--keywords-file`
 - `--options-file`
 - `--library`
+- `--stages-file`
+- `--force`
 - `--max-parallel`
 - `--prepare-only`
 - `--collect-only`
@@ -251,6 +305,15 @@ python3 scripts/run_poscar_folder.py /path/to/structures \
   --max-parallel 32
 ```
 
+### 6. Fixed-cell, variable-cell, and static stages
+
+```bash
+./dist/pygulp-cluster /path/to/structures \
+  --stages-file configs/stages_relax_static.yaml \
+  --library reaxff_general.lib \
+  --max-parallel 32
+```
+
 ## Output Layout
 
 For each structure:
@@ -260,7 +323,7 @@ For each structure:
 └── 00001_structure_name/
     ├── input.cif
     ├── standardized_full.cif
-    ├── asymmetric_unit.cif
+    ├── asymmetric_unit.xyz
     ├── symmetry.json
     ├── keyword.in
     ├── options.in
@@ -272,6 +335,12 @@ For each structure:
         ├── ginput1.gin
         ├── ginput1.got
         ├── relaxed.cif
+        ├── stage_plan.json              # multi-stage mode
+        ├── stage_results.json           # multi-stage mode
+        ├── stages.csv                    # multi-stage mode
+        ├── 01_fixed_cell.gin/.got/.grs  # multi-stage mode
+        ├── 02_variable_cell.gin/.got/.grs
+        ├── 03_static.gin/.got
         ├── job.sh
         ├── <selected_library>.lib  # only when --library is supplied
         ├── slurm_<jobid>.out
@@ -285,6 +354,7 @@ In the output root:
 - `structure_manifest.json`
 - `relaxed_cifs/<ID>.cif`
 - `dispatcher.log`
+- `stages.csv` when multi-stage results exist
 
 ## Summary Columns
 
@@ -314,6 +384,9 @@ The compact summary contains:
 - `energy_final_ev_per_atom`
 - `cif_file`
 - `cif_status`
+- `completed_stages`
+- `total_stages`
+- `failed_stage`
 
 Input paths and technical paths such as `gin`, `got`, `job_script`, and
 `submitted_job_id` are intentionally not stored in the summary.
@@ -373,12 +446,22 @@ Run the symmetry/XLSX self-check with:
 python3 scripts/check_cluster_symmetry.py
 ```
 
+Run the restart and multi-stage self-check with:
+
+```bash
+PYTHONPATH=src python3 scripts/check_multistage_pipeline.py
+```
+
 ## Notes
 
 - This build is cluster-oriented and assumes `SLURM`.
 - Symmetry is detected from the input and used for GULP by default. Use
   `--no-symmetry` to keep the full input structure in P1.
 - `--collect-only` also rebuilds XLSX and the numbered final-CIF directory.
+- Existing `.got`, `relaxed.cif`, and stage results are preserved unless
+  `--force` is explicitly supplied.
+- When recursive input search is enabled, a nested output directory is excluded
+  so generated CIF files cannot be submitted as new structures.
 - `gulp` itself is not bundled into the binary.
 - `.lib` files are not bundled into the binary.
 - If `ginput1.got` exists but the optimization did not converge, the final
