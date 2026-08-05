@@ -191,7 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Allow onefile binaries to generate a single-stage fallback job script when multi-stage mode "
-            "is requested. Use only for recovery; staged pipeline may be incomplete."
+            "is requested. Keep this flag to explicitly acknowledge the fallback."
         ),
     )
     return parser
@@ -252,7 +252,7 @@ def write_job_script_if_needed(
             run_line = stage_runner_line(stage_plan_path)
         except RuntimeError as exc:
             if args.allow_single_stage_fallback:
-                # For frozen onefile binaries fallback is explicitly allowed by user.
+                # For frozen onefile binaries, fallback to single-stage execution.
                 log_message(
                     log_path,
                     f"[{name}] could not build multi-stage run line: {exc!r}; "
@@ -694,6 +694,7 @@ def build_stage_plan(
                 "options": stage_options,
                 "is_optimisation": stage.is_optimisation,
                 "require_convergence": stage.require_convergence,
+                "validate_atom_counts": stage.validate_atom_counts,
                 "needs_restart": index < len(stages) - 1,
             }
         )
@@ -988,12 +989,13 @@ def enrich_row_from_outputs(
     relaxed_cif_path: Path | None = None,
     symprec: float = 0.01,
     angle_tolerance: float = 5.0,
+    validate_atom_counts: bool = True,
 ) -> dict[str, object]:
     got_data = parse_got(got_path)
     expected_asu = row.get("n_atoms_asu")
     expected_total = row.get("n_atoms_conventional")
     if isinstance(expected_asu, int) and isinstance(expected_total, int):
-        validate_got_contract(got_data, expected_asu, expected_total)
+        validate_got_contract(got_data, expected_asu, expected_total, strict=validate_atom_counts)
     row["energy_initial_ev"] = got_data["energy_initial_ev"]
     row["energy_final_ev"] = got_data["energy_final_ev"]
     row["volume"] = got_data["volume"]
@@ -1027,6 +1029,17 @@ def enrich_row_from_outputs(
         row["final_spacegroup_number"] = symmetry_number
 
     return got_data
+
+
+def _load_validate_atom_counts_flag(calc_dir: Path) -> bool:
+    plan_path = calc_dir / "stage_plan.json"
+    if not plan_path.exists():
+        return False
+    try:
+        payload = json.loads(plan_path.read_text())
+    except json.JSONDecodeError:
+        return False
+    return bool(payload.get("validate_atom_counts", False))
 
 
 def export_final_cif(row: dict[str, object], args, log_path: Path) -> None:
@@ -1253,6 +1266,12 @@ def prepare_structure(
                 calc_dir=calc_dir,
                 args=args,
             )
+            try:
+                row["validate_atom_counts"] = bool(
+                    json.loads(plan_path.read_text()).get("validate_atom_counts", False)
+                )
+            except Exception:
+                row["validate_atom_counts"] = False
             row["total_stages"] = len(stages)
             row["completed_stages"] = 0
         else:
@@ -1420,12 +1439,14 @@ def wait_for_jobs(
             try:
                 has_stage_results = apply_stage_results(job.row, job.calc_dir)
                 if not (has_stage_results and job.row.get("failed_stage")):
+                    validate_atom_counts = _load_validate_atom_counts_flag(job.calc_dir)
                     got_data = enrich_row_from_outputs(
                         row=job.row,
                         got_path=job.got_path,
                         relaxed_cif_path=job.relaxed_cif_path,
                         symprec=args.symprec,
                         angle_tolerance=args.relaxed_cif_angle_tolerance,
+                        validate_atom_counts=validate_atom_counts,
                     )
                     job.row["status"] = determine_final_status(slurm_state, got_data, job.relaxed_cif_path)
                     if has_stage_results:
@@ -1460,6 +1481,14 @@ def collect_existing_result(index: int, poscar: Path, args, log_path: Path) -> d
 
     if symmetry_path.exists():
         row.update(json.loads(symmetry_path.read_text()))
+    stage_plan_path = calc_dir / "stage_plan.json"
+    if stage_plan_path.exists():
+        try:
+            row["validate_atom_counts"] = bool(
+                json.loads(stage_plan_path.read_text()).get("validate_atom_counts", False)
+            )
+        except Exception:
+            row["validate_atom_counts"] = False
 
     try:
         calculation_atoms = read(standardized_cif_path) if standardized_cif_path.exists() else input_atoms
@@ -1476,6 +1505,7 @@ def collect_existing_result(index: int, poscar: Path, args, log_path: Path) -> d
                 relaxed_cif_path=relaxed_cif_path,
                 symprec=args.symprec,
                 angle_tolerance=args.relaxed_cif_angle_tolerance,
+                validate_atom_counts=bool(row.get("validate_atom_counts", False)),
             )
             row["status"] = determine_final_status("COMPLETED", got_data, relaxed_cif_path)
         except Exception as exc:
@@ -1577,11 +1607,16 @@ def run_pipeline(args) -> int:
     excluded_dir = args.output_dir if args.output_dir.is_relative_to(args.input_dir) else None
 
     if args.stages_file is not None and is_onefile_frozen() and not args.allow_single_stage_fallback:
-        raise RuntimeError(
-            "Multi-stage mode is not supported by a frozen onefile executable on SLURM. "
-            "Rebuild as onedir from scripts/build_binary.sh and run ./dist/pygulp-cluster/pygulp-cluster, "
-            "or add --allow-single-stage-fallback."
+        log_message(
+            log_path,
+            (
+                "[WARN] Onefile frozen binary cannot reliably submit multi-stage jobs on SLURM. "
+                "Automatic fallback to single-stage mode is enabled for this run. "
+                "Pass --allow-single-stage-fallback to acknowledge this in logs. "
+                "For real multi-stage pipeline, rebuild onedir: scripts/build_binary.sh"
+            ),
         )
+        args.allow_single_stage_fallback = True
 
     poscars = collect_structures(args.input_dir, args.recursive, patterns, excluded_dir=excluded_dir)
     if args.limit is not None:

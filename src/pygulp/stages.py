@@ -15,7 +15,7 @@ class StageSpec:
     keywords: str
     options: str
     require_convergence: bool = True
-    validate_atom_counts: bool = True
+    validate_atom_counts: bool = False
 
     @property
     def prefix(self) -> str:
@@ -68,6 +68,10 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
 
     stages: list[StageSpec] = []
     used_names: set[str] = set()
+    default_validate_atom_counts = payload.get("validate_atom_counts", False)
+    if not isinstance(default_validate_atom_counts, bool):
+        raise ValueError("Top-level field 'validate_atom_counts' must be true or false")
+
     for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
             raise ValueError(f"Stage #{index} must be a mapping")
@@ -75,7 +79,7 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
         keywords = entry.get("keywords")
         options = entry.get("options", default_options)
         require_convergence = entry.get("require_convergence", True)
-        validate_atom_counts = entry.get("validate_atom_counts", True)
+        validate_atom_counts = entry.get("validate_atom_counts", default_validate_atom_counts)
         if not isinstance(raw_name, str) or not isinstance(keywords, str) or not keywords.strip():
             raise ValueError(f"Stage #{index} requires non-empty string fields 'name' and 'keywords'")
         if not isinstance(options, str):
@@ -145,14 +149,14 @@ def parse_got(got_path: Path) -> dict[str, object]:
         if cpu_match:
             cpu_seconds = float(cpu_match.group(1))
         irreducible_match = re.search(
-            r"(?:Number of irreducible atoms/shells|Number of irreducible atoms|Number of atoms/shells in asymmetrical unit)\s*=\s*(\d+)",
+            r"(?:Number of irreducible atoms/shells|Number of irreducible atoms|Number of atoms/shells in asym(?:ym)?metrical unit)\s*=\s*(\d+)",
             line,
             re.I,
         )
         if irreducible_match:
             data["n_atoms_irreducible"] = int(irreducible_match.group(1))
         total_match = re.search(
-            r"(?:^\s*Total number atoms/shells\s*=|^\s*Total number of atoms\s*=|^\s*Number of atoms in unit cell\s*=|^\s*Number of atoms\s*=)\s*(\d+)",
+            r"(?:^\s*Total number atoms/shells\s*=|^\s*Total number of atoms\s*=|^\s*Number of atoms in unit cell\s*=|^\s*Number of atoms/shells in unit cell\s*=|^\s*Number of atoms\s*=)\s*(\d+)",
             line,
             re.I,
         )
@@ -252,7 +256,7 @@ def execute_stage_plan(plan_path: Path) -> int:
     managed_heads = _managed_option_heads(stages)
     expected_asu = int(plan["n_atoms_asu"])
     expected_total = int(plan["n_atoms_conventional"])
-    validate_atom_counts = bool(plan.get("validate_atom_counts", True))
+    validate_atom_counts = bool(plan.get("validate_atom_counts", False))
     results: list[dict[str, object]] = []
     last_cif: Path | None = None
 

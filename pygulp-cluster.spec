@@ -25,7 +25,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="pygulp-cluster.bin",
+    name="pygulp-cluster",
     debug=False,
     strip=False,
     upx=False,

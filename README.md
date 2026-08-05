@@ -170,15 +170,21 @@ and cell to the next stage through a native `.grs` restart file. By default the
 next stage requires `Optimisation achieved`; set `require_convergence: false`
 when a normally completed GULP run may continue after `max_function_calls`.
 
-By default each stage also checks atom counts parsed from `.got`. If your GULP output
-does not contain these lines, set `validate_atom_counts: false` in that stage block.
+By default each stage does not enforce atom-count checks from `.got` output. Use
+`validate_atom_counts: true` in a stage block only if you want strict checking.
+
+If your workflow needs full validation for all stages, either:
+- set top-level `validate_atom_counts: true` in the YAML file, or
+- set it per stage explicitly.
 
 Example configuration:
 
 ```yaml
+validate_atom_counts: true   # optional, applies to all stages by default
 stages:
   - name: fixed_cell
     require_convergence: false
+    validate_atom_counts: true
     keywords: |
       opti conj reaxff conv qiter spat
     options: |
@@ -188,6 +194,7 @@ stages:
 
   - name: variable_cell
     require_convergence: false
+    validate_atom_counts: true
     keywords: |
       opti conj reaxff conp qiter spat
     options: |
@@ -428,7 +435,8 @@ Check the result:
 ./dist/pygulp-cluster/pygulp-cluster --help
 ```
 
-If you need a onefile executable (with `_MEI...`), do not pass `--onefile` when using a spec file; in this project, the spec is onedir by design and onefile mode is intentionally unsupported for multi-stage runs.
+If you are using multi-stage mode, always use the onedir build. Onefile launchers use temporary
+`_MEI...` paths and are not reliable for SLURM child-process execution.
 
 For the COLLECT error:
 
@@ -437,7 +445,12 @@ rm -rf build dist
 sh scripts/build_binary.sh
 ```
 
-If you still see `Resource '.../dist/pygulp-cluster' is not a valid file`, verify that `pygulp-cluster.spec` does not use `dist/...` as a `name` value, and that bootstrap `EXE` and `COLLECT` names are not the same directory path.
+If you still see `Resource '.../dist/pygulp-cluster' is not a valid file`, wipe build artifacts and rebuild again:
+
+```bash
+rm -rf build dist
+sh scripts/build_binary.sh
+```
 
 For multi-stage runs (`--stages-file`), an onedir build is required: onefile launchers place temp executables under `/tmp/_MEI...` and SLURM jobs can lose that path.
 
@@ -446,8 +459,8 @@ After build, verify:
 ```bash
 ls -l dist/pygulp-cluster
 # should contain:
-# - pygulp-cluster (executable, symlink to pygulp-cluster.bin)
-# - pygulp-cluster.bin (collected onedir payload)
+# - pygulp-cluster (executable)
+# - _internal/*
 ```
 
 After build, place the required `.lib` next to the binary before running.

@@ -15,10 +15,14 @@ python3 -m PyInstaller \
   --distpath dist \
   pygulp-cluster.spec
 
-if [ -f "$DIST_DIR/pygulp-cluster.bin" ] && [ "$DIST_DIR/pygulp-cluster" != "$DIST_DIR/pygulp-cluster.bin" ]; then
-  ln -sfn "pygulp-cluster.bin" "$DIST_DIR/pygulp-cluster"
-fi
-
 if [ -f "$DIST_DIR/pygulp-cluster" ]; then
   chmod +x "$DIST_DIR/pygulp-cluster"
+else
+  echo "[ERROR] Expected onedir executable not found: $DIST_DIR/pygulp-cluster"
+  exit 1
+fi
+
+if [ -f "$ROOT_DIR/dist/pygulp-cluster.bin" ]; then
+  echo "[WARN] Legacy top-level pygulp-cluster.bin found. It may be a onefile build. Removing."
+  rm -f "$ROOT_DIR/dist/pygulp-cluster.bin"
 fi
