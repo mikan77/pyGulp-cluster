@@ -92,7 +92,7 @@ dist/
 Then launch with:
 
 ```bash
-./dist/pygulp-cluster /path/to/structures --library reaxff_general.lib
+./dist/pygulp-cluster/pygulp-cluster /path/to/structures --library reaxff_general.lib
 ```
 
 If `--library` is omitted, no `.lib` file is copied and no `library ...` line is
@@ -302,7 +302,7 @@ python3 scripts/run_poscar_folder.py /path/to/structures \
 ### 5. Run through the binary
 
 ```bash
-./dist/pygulp-cluster /path/to/structures \
+./dist/pygulp-cluster/pygulp-cluster /path/to/structures \
   --library reaxff_general.lib \
   --max-parallel 32
 ```
@@ -310,7 +310,7 @@ python3 scripts/run_poscar_folder.py /path/to/structures \
 ### 6. Fixed-cell, variable-cell, and static stages
 
 ```bash
-./dist/pygulp-cluster /path/to/structures \
+./dist/pygulp-cluster/pygulp-cluster /path/to/structures \
   --stages-file configs/stages_relax_static.yaml \
   --library reaxff_general.lib \
   --max-parallel 32
@@ -404,7 +404,7 @@ sh scripts/build_binary.sh
 This uses `PyInstaller` and writes the binary to:
 
 ```text
-dist/pygulp-cluster
+dist/pygulp-cluster/pygulp-cluster
 ```
 
 If `PyInstaller` is not installed:
@@ -423,8 +423,10 @@ sh scripts/build_binary.sh
 Check the result:
 
 ```bash
-./dist/pygulp-cluster --help
+./dist/pygulp-cluster/pygulp-cluster --help
 ```
+
+If you need a onefile executable (with `_MEI...`), do not pass `--onefile` when using a spec file; in this project, the spec is onedir by design and the onefile mode is intentionally disabled.
 
 After build, place the required `.lib` next to the binary before running.
 
