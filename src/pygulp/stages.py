@@ -268,11 +268,12 @@ def execute_stage_plan(plan_path: Path) -> int:
             validate_got_contract(data, expected_asu, expected_total)
             if completed.returncode != 0:
                 raise RuntimeError(f"GULP command returned exit code {completed.returncode}")
-            if not data.get("completed_normally"):
+            require_convergence = bool(stage.get("require_convergence", True))
+            if not data.get("completed_normally") and (not bool(stage["is_optimisation"]) or require_convergence):
                 raise RuntimeError("GULP did not report normal completion")
             converged = not bool(stage["is_optimisation"]) or data.get("gulp_status") == "optimisation_achieved"
             row["converged"] = converged
-            if bool(stage["is_optimisation"]) and bool(stage.get("require_convergence", True)) and not converged:
+            if bool(stage["is_optimisation"]) and require_convergence and not converged:
                 raise RuntimeError(str(data.get("gulp_status") or "optimisation did not converge"))
             if stage.get("needs_restart") and not restart_path.exists():
                 raise FileNotFoundError(f"GULP did not write restart file {restart_path.name}")
