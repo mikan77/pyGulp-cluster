@@ -269,7 +269,7 @@ def execute_stage_plan(plan_path: Path) -> int:
             if completed.returncode != 0:
                 raise RuntimeError(f"GULP command returned exit code {completed.returncode}")
             require_convergence = bool(stage.get("require_convergence", True))
-            if not data.get("completed_normally") and (not bool(stage["is_optimisation"]) or require_convergence):
+            if require_convergence and not data.get("completed_normally"):
                 raise RuntimeError("GULP did not report normal completion")
             converged = not bool(stage["is_optimisation"]) or data.get("gulp_status") == "optimisation_achieved"
             row["converged"] = converged

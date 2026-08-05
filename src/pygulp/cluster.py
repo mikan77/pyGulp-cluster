@@ -195,6 +195,10 @@ def runtime_directory() -> Path:
     return Path(sys.argv[0]).resolve().parent
 
 
+def is_onefile_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False) and getattr(sys, "_MEIPASS", None))
+
+
 def log_message(log_path: Path, message: str) -> None:
     stamped = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
     print(stamped)
@@ -608,6 +612,12 @@ def render_job_script(job_name: str, calc_dir: Path, args, run_line: str | None 
 
 
 def stage_runner_line(plan_path: Path) -> str:
+    if is_onefile_frozen():
+        raise RuntimeError(
+            "Frozen onefile executables cannot reliably run stage plans on SLURM because the launcher path is temporary "
+            "(_MEIxxx). Build and use an onedir binary from scripts/build_binary.sh."
+        )
+
     if getattr(sys, "frozen", False):
         command = [str(Path(sys.executable).resolve())]
     else:
@@ -616,7 +626,7 @@ def stage_runner_line(plan_path: Path) -> str:
             command = [sys.executable, str(launcher)]
         else:
             command = [sys.executable, "-m", "pygulp.cli"]
-    command.extend(["--execute-stage-plan", plan_path.name])
+    command.extend(["--execute-stage-plan", str(plan_path.resolve())])
     return " ".join(shlex.quote(item) for item in command)
 
 

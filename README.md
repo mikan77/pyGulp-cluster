@@ -426,7 +426,7 @@ Check the result:
 ./dist/pygulp-cluster/pygulp-cluster --help
 ```
 
-If you need a onefile executable (with `_MEI...`), do not pass `--onefile` when using a spec file; in this project, the spec is onedir by design and the onefile mode is intentionally disabled.
+If you need a onefile executable (with `_MEI...`), do not pass `--onefile` when using a spec file; in this project, the spec is onedir by design and onefile mode is intentionally unsupported for multi-stage runs.
 
 For the COLLECT error:
 
@@ -435,7 +435,18 @@ rm -rf build dist
 sh scripts/build_binary.sh
 ```
 
-If you still see `Resource '.../dist/pygulp-cluster' is not a valid file`, verify that `pygulp-cluster.spec` has `name='pygulp-cluster'` (without any `dist/` prefix) in both `EXE` and `COLLECT`.
+If you still see `Resource '.../dist/pygulp-cluster' is not a valid file`, verify that `pygulp-cluster.spec` does not use `dist/...` as a `name` value, and that bootstrap `EXE` and `COLLECT` names are not the same directory path.
+
+For multi-stage runs (`--stages-file`), an onedir build is required: onefile launchers place temp executables under `/tmp/_MEI...` and SLURM jobs can lose that path.
+
+After build, verify:
+
+```bash
+ls -l dist/pygulp-cluster
+# should contain:
+# - pygulp-cluster (executable, symlink to pygulp-cluster.bin)
+# - pygulp-cluster.bin (collected onedir payload)
+```
 
 After build, place the required `.lib` next to the binary before running.
 
