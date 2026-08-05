@@ -186,6 +186,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-symmetry", action="store_true", help="Write the full input structure as P1.")
     parser.add_argument("--exclude-periodic-bonds", action="store_true", help="Drop bonds through periodic images.")
     parser.add_argument("--natural-mult", type=float, default=1.1, help="ASE natural cutoff multiplier.")
+    parser.add_argument(
+        "--allow-single-stage-fallback",
+        action="store_true",
+        help=(
+            "Allow onefile binaries to generate a single-stage fallback job script when multi-stage mode "
+            "is requested. Use only for recovery; staged pipeline may be incomplete."
+        ),
+    )
     return parser
 
 
@@ -222,6 +230,40 @@ def collect_structures(
             if path.is_file() and (excluded_dir is None or not resolved.is_relative_to(excluded_dir)):
                 paths.add(resolved)
     return sorted(paths)
+
+
+def write_job_script_if_needed(
+    name: str,
+    calc_dir: Path,
+    args,
+    log_path: Path,
+    stage_plan_path: Path | None = None,
+    force: bool = True,
+) -> Path | None:
+    """Create CalcFold job script if possible and return its path, or None on failure."""
+    job_script_path = calc_dir / args.job_script_name
+    if job_script_path.exists() and not force:
+        return job_script_path
+
+    run_line = None
+
+    if stage_plan_path is not None and stage_plan_path.exists():
+        try:
+            run_line = stage_runner_line(stage_plan_path, calc_dir=calc_dir)
+        except RuntimeError as exc:
+            if args.allow_single_stage_fallback:
+                # For frozen onefile binaries fallback is explicitly allowed by user.
+                log_message(
+                    log_path,
+                    f"[{name}] could not build multi-stage run line: {exc!r}; "
+                    "fallback to single ginput1.gin run is enabled",
+                )
+            else:
+                raise
+
+    job_script_path.write_text(render_job_script(name, calc_dir, args, run_line=run_line))
+    job_script_path.chmod(0o755)
+    return job_script_path
 
 
 def detect_input_format(path: Path, requested_format: str) -> str | None:
@@ -611,14 +653,20 @@ def render_job_script(job_name: str, calc_dir: Path, args, run_line: str | None 
     return "\n".join(sbatch_lines + body) + "\n"
 
 
-def stage_runner_line(plan_path: Path) -> str:
+def stage_runner_line(plan_path: Path, calc_dir: Path | None = None) -> str:
     if is_onefile_frozen():
-        raise RuntimeError(
-            "Frozen onefile executables cannot reliably run stage plans on SLURM because the launcher path is temporary "
-            "(_MEIxxx). Build and use an onedir binary from scripts/build_binary.sh."
-        )
-
-    if getattr(sys, "frozen", False):
+        if calc_dir is None:
+            raise RuntimeError(
+                "Frozen onefile executables cannot resolve stage runner without explicit calc_dir. "
+                "Pass --allow-single-stage-fallback or rebuild as onedir."
+            )
+        runner = calc_dir / "pygulp-stage-runner"
+        source_executable = Path(sys.executable).resolve()
+        if (not runner.exists()) or (runner.stat().st_mtime < source_executable.stat().st_mtime):
+            shutil.copy2(source_executable, runner)
+            runner.chmod(0o755)
+        command = [str(runner)]
+    elif getattr(sys, "frozen", False):
         command = [str(Path(sys.executable).resolve())]
     else:
         launcher = Path(sys.argv[0]).resolve()
@@ -1086,6 +1134,19 @@ def prepare_structure(
                 + ", ".join(path.name for path in existing_results),
             )
             existing_row = collect_existing_result(index, poscar, args, log_path)
+            stage_plan_path = calc_dir / "stage_plan.json"
+            try:
+                job_script_path = write_job_script_if_needed(
+                    name,
+                    calc_dir,
+                    args,
+                    log_path,
+                    stage_plan_path=stage_plan_path,
+                    force=False,
+                )
+            except Exception as exc:
+                log_message(log_path, f"[{index}] failed to create job script for existing results: {exc!r}")
+                job_script_path = None
             return PreparedJob(
                 index=index,
                 poscar=poscar,
@@ -1095,7 +1156,7 @@ def prepare_structure(
                 got_path=got_path,
                 input_cif_path=input_cif_path,
                 relaxed_cif_path=relaxed_cif_path,
-                job_script_path=None,
+                job_script_path=job_script_path,
                 row=existing_row,
             )
         for stale_file in (got_path, relaxed_cif_path, calc_dir / "opt_step"):
@@ -1197,7 +1258,6 @@ def prepare_structure(
                 calc_dir=calc_dir,
                 args=args,
             )
-            run_line = stage_runner_line(plan_path)
             row["total_stages"] = len(stages)
             row["completed_stages"] = 0
         else:
@@ -1210,11 +1270,14 @@ def prepare_structure(
             )
             validate_gin_contract(gin_text, len(asu_atoms), spacegroup_number)
             gin_path.write_text(gin_text)
-            run_line = None
 
-        job_script_path = calc_dir / args.job_script_name
-        job_script_path.write_text(render_job_script(name, calc_dir, args, run_line=run_line))
-        job_script_path.chmod(0o755)
+        job_script_path = write_job_script_if_needed(
+            name,
+            calc_dir,
+            args,
+            log_path,
+            stage_plan_path=calc_dir / "stage_plan.json" if stages else None,
+        )
 
         row["status"] = "prepared"
         return PreparedJob(
