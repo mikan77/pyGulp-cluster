@@ -223,21 +223,21 @@ def rewrite_restart(restart_text: str, stage: dict[str, object], managed_heads: 
     if title_index is None:
         raise ValueError("GULP restart does not contain a title block")
 
-    kept = [str(stage["keywords"]).rstrip(), *lines[title_index:]]
     filtered = []
-    for line in kept:
+    for line in lines[title_index:]:
         words = line.split()
         if words and words[0].lower() in managed_heads:
             continue
         filtered.append(line)
 
+    kept = [*str(stage["keywords"]).splitlines(), *filtered]
     options = str(stage.get("options", "")).rstrip()
     if options:
-        filtered.extend(["", options])
-    filtered.append(f"output movie cif {stage['prefix']}.cif")
+        kept.extend(["", options])
+    kept.append(f"output movie cif {stage['prefix']}.cif")
     if bool(stage.get("needs_restart")):
-        filtered.append(f"dump {stage['prefix']}.grs")
-    return "\n".join(filtered).rstrip() + "\n"
+        kept.append(f"dump {stage['prefix']}.grs")
+    return "\n".join(kept).rstrip() + "\n"
 
 
 def write_stage_results(calc_dir: Path, rows: list[dict[str, object]]) -> None:
