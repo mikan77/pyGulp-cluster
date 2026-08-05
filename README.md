@@ -428,6 +428,15 @@ Check the result:
 
 If you need a onefile executable (with `_MEI...`), do not pass `--onefile` when using a spec file; in this project, the spec is onedir by design and the onefile mode is intentionally disabled.
 
+For the COLLECT error:
+
+```bash
+rm -rf build dist
+sh scripts/build_binary.sh
+```
+
+If you still see `Resource '.../dist/pygulp-cluster' is not a valid file`, verify that `pygulp-cluster.spec` has `name='pygulp-cluster'` (without any `dist/` prefix) in both `EXE` and `COLLECT`.
+
 After build, place the required `.lib` next to the binary before running.
 
 ## Development Entry Points
