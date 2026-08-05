@@ -169,7 +169,9 @@ Each non-final stage must be an optimisation. GULP passes its updated geometry
 and cell to the next stage through a native `.grs` restart file. By default the
 next stage requires `Optimisation achieved`; set `require_convergence: false`
 when a normally completed GULP run may continue after `max_function_calls`.
-The expected restart and irreducible/total atom counts are always required.
+
+By default each stage also checks atom counts parsed from `.got`. If your GULP output
+does not contain these lines, set `validate_atom_counts: false` in that stage block.
 
 Example configuration:
 

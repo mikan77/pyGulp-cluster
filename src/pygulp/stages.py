@@ -15,6 +15,7 @@ class StageSpec:
     keywords: str
     options: str
     require_convergence: bool = True
+    validate_atom_counts: bool = True
 
     @property
     def prefix(self) -> str:
@@ -74,12 +75,15 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
         keywords = entry.get("keywords")
         options = entry.get("options", default_options)
         require_convergence = entry.get("require_convergence", True)
+        validate_atom_counts = entry.get("validate_atom_counts", True)
         if not isinstance(raw_name, str) or not isinstance(keywords, str) or not keywords.strip():
             raise ValueError(f"Stage #{index} requires non-empty string fields 'name' and 'keywords'")
         if not isinstance(options, str):
             raise ValueError(f"Stage #{index} field 'options' must be a string")
         if not isinstance(require_convergence, bool):
             raise ValueError(f"Stage #{index} field 'require_convergence' must be true or false")
+        if not isinstance(validate_atom_counts, bool):
+            raise ValueError(f"Stage #{index} field 'validate_atom_counts' must be true or false")
         cleaned_name = sanitize_stage_name(raw_name)
         if cleaned_name in used_names:
             raise ValueError(f"Duplicate stage name: {raw_name}")
@@ -91,6 +95,7 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
                 keywords=keywords.rstrip(),
                 options=options.rstrip(),
                 require_convergence=require_convergence,
+                validate_atom_counts=validate_atom_counts,
             )
         )
 
@@ -139,10 +144,18 @@ def parse_got(got_path: Path) -> dict[str, object]:
         cpu_match = re.search(r"Total CPU time\s+([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)", line)
         if cpu_match:
             cpu_seconds = float(cpu_match.group(1))
-        irreducible_match = re.search(r"Number of irreducible atoms/shells\s*=\s*(\d+)", line)
+        irreducible_match = re.search(
+            r"(?:Number of irreducible atoms/shells|Number of irreducible atoms|Number of atoms/shells in asymmetrical unit)\s*=\s*(\d+)",
+            line,
+            re.I,
+        )
         if irreducible_match:
             data["n_atoms_irreducible"] = int(irreducible_match.group(1))
-        total_match = re.search(r"Total number atoms/shells\s*=\s*(\d+)", line)
+        total_match = re.search(
+            r"(?:^\s*Total number atoms/shells\s*=|^\s*Total number of atoms\s*=|^\s*Number of atoms in unit cell\s*=|^\s*Number of atoms\s*=)\s*(\d+)",
+            line,
+            re.I,
+        )
         if total_match:
             data["n_atoms_total"] = int(total_match.group(1))
         if "Optimisation achieved" in line:
@@ -163,9 +176,24 @@ def parse_got(got_path: Path) -> dict[str, object]:
     return data
 
 
-def validate_got_contract(data: dict[str, object], expected_asu: int, expected_total: int) -> None:
+def validate_got_contract(
+    data: dict[str, object],
+    expected_asu: int,
+    expected_total: int,
+    *,
+    strict: bool = True,
+) -> None:
     actual_asu = data.get("n_atoms_irreducible")
     actual_total = data.get("n_atoms_total")
+
+    if actual_asu is None or actual_total is None:
+        if strict:
+            raise ValueError(
+                "GULP atom-count lines were not found in output. "
+                "Set validate_atom_counts: false in stage configuration to skip this check."
+            )
+        return
+
     if actual_asu != expected_asu or actual_total != expected_total:
         raise ValueError(
             "GULP atom-count mismatch: "
@@ -224,6 +252,7 @@ def execute_stage_plan(plan_path: Path) -> int:
     managed_heads = _managed_option_heads(stages)
     expected_asu = int(plan["n_atoms_asu"])
     expected_total = int(plan["n_atoms_conventional"])
+    validate_atom_counts = bool(plan.get("validate_atom_counts", True))
     results: list[dict[str, object]] = []
     last_cif: Path | None = None
 
@@ -265,7 +294,8 @@ def execute_stage_plan(plan_path: Path) -> int:
             completed = subprocess.run(command, cwd=calc_dir, shell=True, check=False)
             data = parse_got(got_path)
             row.update({key: data.get(key) for key in STAGE_RESULT_FIELDS if key in data})
-            validate_got_contract(data, expected_asu, expected_total)
+            if validate_atom_counts:
+                validate_got_contract(data, expected_asu, expected_total)
             if completed.returncode != 0:
                 raise RuntimeError(f"GULP command returned exit code {completed.returncode}")
             require_convergence = bool(stage.get("require_convergence", True))

@@ -1,6 +1,8 @@
 stages:
   - name: fixed_cell
     require_convergence: false
+    # Set to false only if GULP output format does not print atom-count checks
+    validate_atom_counts: false
     keywords: |
       opti conj reaxff conv qiter spat
       parallel better_scaling

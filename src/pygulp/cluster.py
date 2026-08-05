@@ -721,6 +721,7 @@ def build_stage_plan(
         "n_atoms_asu": len(asu_atoms),
         "n_atoms_conventional": n_atoms_conventional,
         "spacegroup_number": spacegroup_number,
+        "validate_atom_counts": all(stage["validate_atom_counts"] for stage in stage_payloads),
         "gulp_command": stage_gulp_command(args),
         "stages": stage_payloads,
     }
