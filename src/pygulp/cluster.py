@@ -249,7 +249,7 @@ def write_job_script_if_needed(
 
     if stage_plan_path is not None and stage_plan_path.exists():
         try:
-            run_line = stage_runner_line(stage_plan_path, calc_dir=calc_dir)
+            run_line = stage_runner_line(stage_plan_path)
         except RuntimeError as exc:
             if args.allow_single_stage_fallback:
                 # For frozen onefile binaries fallback is explicitly allowed by user.
@@ -653,19 +653,13 @@ def render_job_script(job_name: str, calc_dir: Path, args, run_line: str | None 
     return "\n".join(sbatch_lines + body) + "\n"
 
 
-def stage_runner_line(plan_path: Path, calc_dir: Path | None = None) -> str:
+def stage_runner_line(plan_path: Path) -> str:
     if is_onefile_frozen():
-        if calc_dir is None:
-            raise RuntimeError(
-                "Frozen onefile executables cannot resolve stage runner without explicit calc_dir. "
-                "Pass --allow-single-stage-fallback or rebuild as onedir."
-            )
-        runner = calc_dir / "pygulp-stage-runner"
-        source_executable = Path(sys.executable).resolve()
-        if (not runner.exists()) or (runner.stat().st_mtime < source_executable.stat().st_mtime):
-            shutil.copy2(source_executable, runner)
-            runner.chmod(0o755)
-        command = [str(runner)]
+        raise RuntimeError(
+            "Frozen onefile executables cannot reliably run stage plans on SLURM. "
+            "Use onedir build (./dist/pygulp-cluster/pygulp-cluster) for multi-stage mode, "
+            "or run with --allow-single-stage-fallback for one non-staged GULP task."
+        )
     elif getattr(sys, "frozen", False):
         command = [str(Path(sys.executable).resolve())]
     else:
@@ -1580,6 +1574,14 @@ def run_pipeline(args) -> int:
 
     patterns = tuple(args.pattern) if args.pattern else DEFAULT_PATTERNS
     excluded_dir = args.output_dir if args.output_dir.is_relative_to(args.input_dir) else None
+
+    if args.stages_file is not None and is_onefile_frozen() and not args.allow_single_stage_fallback:
+        raise RuntimeError(
+            "Multi-stage mode is not supported by a frozen onefile executable on SLURM. "
+            "Rebuild as onedir from scripts/build_binary.sh and run ./dist/pygulp-cluster/pygulp-cluster, "
+            "or add --allow-single-stage-fallback."
+        )
+
     poscars = collect_structures(args.input_dir, args.recursive, patterns, excluded_dir=excluded_dir)
     if args.limit is not None:
         poscars = poscars[: args.limit]
