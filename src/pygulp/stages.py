@@ -211,9 +211,9 @@ def _managed_option_heads(stages: list[dict[str, object]]) -> set[str]:
     for stage in stages:
         for block_key in ("options", "keywords"):
             for line in str(stage.get(block_key, "")).splitlines():
-            words = line.split()
-            if words:
-                heads.add(words[0].lower())
+                words = line.split()
+                if words:
+                    heads.add(words[0].lower())
     return heads
 
 
