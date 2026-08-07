@@ -962,6 +962,34 @@ def detect_relaxed_cif_symmetry(
         return None, None
 
 
+def resolve_final_got_path(calc_dir: Path) -> Path:
+    stage_plan_path = calc_dir / "stage_plan.json"
+    if stage_plan_path.exists():
+        try:
+            payload = json.loads(stage_plan_path.read_text())
+            stages = payload.get("stages")
+            if isinstance(stages, list) and stages:
+                last_stage = stages[-1]
+                prefix = str(last_stage.get("prefix", "")).strip()
+                if prefix:
+                    return calc_dir / f"{prefix}.got"
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+
+    stage_results_path = calc_dir / "stage_results.json"
+    if stage_results_path.exists():
+        try:
+            rows = json.loads(stage_results_path.read_text())
+            if isinstance(rows, list) and rows:
+                got = rows[-1].get("got")
+                if isinstance(got, str) and got.strip():
+                    return calc_dir / got.strip()
+        except (json.JSONDecodeError, TypeError, AttributeError, ValueError):
+            pass
+
+    return calc_dir / "ginput1.got"
+
+
 def base_row(identifier: int, name: str, source: Path, work_dir: Path) -> dict[str, object]:
     row = {field: None for field in SUMMARY_FIELDS}
     row.update(
@@ -1004,9 +1032,9 @@ def enrich_row_from_outputs(
     n_atoms = row.get("n_atoms_conventional")
     if isinstance(n_atoms, int) and n_atoms > 0:
         if got_data["energy_initial_ev"] is not None:
-            row["energy_initial_ev_per_atom"] = float(got_data["energy_initial_ev"]) / n_atoms
+            row["energy_initial_ev_per_atom"] = float(got_data["energy_initial_ev"]) / float(n_atoms)
         if got_data["energy_final_ev"] is not None:
-            row["energy_final_ev_per_atom"] = float(got_data["energy_final_ev"]) / n_atoms
+            row["energy_final_ev_per_atom"] = float(got_data["energy_final_ev"]) / float(n_atoms)
 
     volume_value = got_data["volume"]
     if volume_value is not None:
@@ -1121,7 +1149,7 @@ def prepare_structure(
     work_dir = args.output_dir / name
     calc_dir = work_dir / "CalcFold"
     gin_path = calc_dir / "ginput1.gin"
-    got_path = calc_dir / "ginput1.got"
+    got_path = resolve_final_got_path(calc_dir)
     input_cif_path = work_dir / "input.cif"
     relaxed_cif_path = calc_dir / "relaxed.cif"
     row = base_row(index, name, poscar, work_dir)
@@ -1292,7 +1320,7 @@ def prepare_structure(
             log_path,
             stage_plan_path=calc_dir / "stage_plan.json" if stages else None,
         )
-
+        got_path = resolve_final_got_path(calc_dir)
         row["status"] = "prepared"
         return PreparedJob(
             index=index,
@@ -1463,7 +1491,7 @@ def collect_existing_result(index: int, poscar: Path, args, log_path: Path) -> d
     work_dir = args.output_dir / name
     calc_dir = work_dir / "CalcFold"
     gin_path = calc_dir / "ginput1.gin"
-    got_path = calc_dir / "ginput1.got"
+    got_path = resolve_final_got_path(calc_dir)
     relaxed_cif_path = calc_dir / "relaxed.cif"
     standardized_cif_path = work_dir / "standardized_full.cif"
     symmetry_path = work_dir / "symmetry.json"

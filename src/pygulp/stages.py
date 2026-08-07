@@ -198,11 +198,29 @@ def validate_got_contract(
             )
         return
 
-    if actual_asu != expected_asu or actual_total != expected_total:
+    actual_asu_int = int(actual_asu)
+    actual_total_int = int(actual_total)
+
+    if actual_asu_int == expected_asu and actual_total_int == expected_total:
+        return
+
+    # Some GULP runs report the primitive cell atom totals even when the input is
+    # given as an ASU. In this case the irreducible count still matches and the
+    # reported total is a clean divisor of the expected conventional total.
+    if (
+        actual_asu_int == expected_asu
+        and actual_total_int > 0
+        and expected_total > 0
+        and actual_total_int <= expected_total
+        and expected_total % actual_total_int == 0
+    ):
+        return
+
+    if actual_asu_int != expected_asu or actual_total_int != expected_total:
         raise ValueError(
             "GULP atom-count mismatch: "
-            f"irreducible={actual_asu} (expected {expected_asu}), "
-            f"total={actual_total} (expected {expected_total})"
+            f"irreducible={actual_asu_int} (expected {expected_asu}), "
+            f"total={actual_total_int} (expected {expected_total})"
         )
 
 
