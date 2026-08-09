@@ -963,16 +963,36 @@ def detect_relaxed_cif_symmetry(
 
 
 def resolve_final_got_path(calc_dir: Path) -> Path:
+    def as_path(candidate: object) -> Path | None:
+        if not isinstance(candidate, str):
+            return None
+        candidate = candidate.strip()
+        if not candidate:
+            return None
+        return calc_dir / candidate
+
+    def exists_or_latest(paths: list[Path]) -> Path | None:
+        for path in paths:
+            if path.exists():
+                return path
+        return None
+
     stage_plan_path = calc_dir / "stage_plan.json"
     if stage_plan_path.exists():
         try:
             payload = json.loads(stage_plan_path.read_text())
             stages = payload.get("stages")
-            if isinstance(stages, list) and stages:
-                last_stage = stages[-1]
-                prefix = str(last_stage.get("prefix", "")).strip()
-                if prefix:
-                    return calc_dir / f"{prefix}.got"
+            if isinstance(stages, list):
+                preferred_from_plan = []
+                for stage in reversed(stages):
+                    prefix = None
+                    if isinstance(stage, dict):
+                        prefix = stage.get("prefix")
+                    path = as_path(f"{prefix}.got") if prefix else None
+                    if path is not None:
+                        preferred_from_plan.append(path)
+                if path := exists_or_latest(preferred_from_plan):
+                    return path
         except (json.JSONDecodeError, TypeError, AttributeError):
             pass
 
@@ -980,14 +1000,30 @@ def resolve_final_got_path(calc_dir: Path) -> Path:
     if stage_results_path.exists():
         try:
             rows = json.loads(stage_results_path.read_text())
-            if isinstance(rows, list) and rows:
-                got = rows[-1].get("got")
-                if isinstance(got, str) and got.strip():
-                    return calc_dir / got.strip()
+            if isinstance(rows, list):
+                preferred_from_results = []
+                for row in reversed(rows):
+                    if not isinstance(row, dict):
+                        continue
+                    candidate = as_path(row.get("got"))
+                    if candidate is not None:
+                        preferred_from_results.append(candidate)
+                if path := exists_or_latest(preferred_from_results):
+                    return path
         except (json.JSONDecodeError, TypeError, AttributeError, ValueError):
             pass
 
-    return calc_dir / "ginput1.got"
+    fallback = calc_dir / "ginput1.got"
+    if fallback.exists():
+        return fallback
+    got_files = sorted(
+        (path for path in calc_dir.glob("*.got") if path.is_file()),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    if got_files:
+        return got_files[0]
+    return fallback
 
 
 def base_row(identifier: int, name: str, source: Path, work_dir: Path) -> dict[str, object]:
@@ -1512,9 +1548,13 @@ def collect_existing_result(index: int, poscar: Path, args, log_path: Path) -> d
     stage_plan_path = calc_dir / "stage_plan.json"
     if stage_plan_path.exists():
         try:
-            row["validate_atom_counts"] = bool(
-                json.loads(stage_plan_path.read_text()).get("validate_atom_counts", False)
-            )
+            stage_plan = json.loads(stage_plan_path.read_text())
+            row["validate_atom_counts"] = bool(stage_plan.get("validate_atom_counts", False))
+            if isinstance(stage_plan.get("n_atoms_conventional"), int):
+                row["n_atoms_conventional"] = int(stage_plan["n_atoms_conventional"])
+            if isinstance(stage_plan.get("n_atoms_asu"), int):
+                row["n_atoms_asu"] = int(stage_plan["n_atoms_asu"])
+            row["spacegroup_number"] = stage_plan.get("spacegroup_number", row.get("spacegroup_number"))
         except Exception:
             row["validate_atom_counts"] = False
 

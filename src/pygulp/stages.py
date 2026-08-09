@@ -216,6 +216,19 @@ def validate_got_contract(
     ):
         return
 
+    # If both irreducible and total counts are scaled by the same factor
+    # (e.g. both reduced for primitive-cell reporting), accept that as ASU mismatch.
+    if (
+        actual_asu_int > 0
+        and expected_asu > 0
+        and actual_total_int > 0
+        and expected_total > 0
+        and expected_asu % actual_asu_int == 0
+        and expected_total % actual_total_int == 0
+        and expected_asu // actual_asu_int == expected_total // actual_total_int
+    ):
+        return
+
     if actual_asu_int != expected_asu or actual_total_int != expected_total:
         raise ValueError(
             "GULP atom-count mismatch: "
