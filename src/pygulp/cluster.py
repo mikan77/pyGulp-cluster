@@ -1146,11 +1146,31 @@ def _load_validate_atom_counts_flag(calc_dir: Path) -> bool:
     return bool(payload.get("validate_atom_counts", False))
 
 
-def export_final_cif(row: dict[str, object], args, log_path: Path) -> None:
-    identifier = int(row["ID"])
+def _relaxed_cif_filename(row: dict[str, object], used_names: set[str]) -> str:
+    source = Path(str(row.get("_source") or ""))
+    filename = source.name
+    if not filename or filename in {".", ".."}:
+        filename = f"{sanitize_name(str(row.get('name') or row.get('ID') or 'structure'))}.cif"
+    elif source.suffix.lower() != ".cif":
+        filename = f"{filename}.cif"
+
+    candidate = filename
+    if candidate in used_names:
+        path = Path(filename)
+        identifier = int(row["ID"])
+        candidate = f"{path.stem}_{identifier:05d}{path.suffix}"
+        suffix = 2
+        while candidate in used_names:
+            candidate = f"{path.stem}_{identifier:05d}_{suffix}{path.suffix}"
+            suffix += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def export_final_cif(row: dict[str, object], args, log_path: Path, used_names: set[str]) -> None:
     source_cif = Path(str(row["_relaxed_cif_path"]))
     output_dir = resolve_relaxed_cif_output_dir(args.output_dir, args.relaxed_cif_dir)
-    output_cif = output_dir / f"{identifier}.cif"
+    output_cif = output_dir / _relaxed_cif_filename(row, used_names)
     row["cif_file"] = output_cif.name
 
     if not source_cif.exists():
@@ -1181,12 +1201,13 @@ def export_final_cif(row: dict[str, object], args, log_path: Path) -> None:
             row["n_molecules_final"] = len(set(int(tag) for tag in tags))
         except Exception as exc:
             row["cif_status"] = f"{cif_row['status']}; molecule_count_failed"
-            log_message(log_path, f"[{identifier}] final molecule count failed: {exc!r}")
+            log_message(log_path, f"[{row['ID']}] final molecule count failed: {exc!r}")
 
 
 def export_final_cifs(rows: list[dict[str, object]], args, log_path: Path) -> None:
+    used_names: set[str] = set()
     for row in rows:
-        export_final_cif(row, args, log_path)
+        export_final_cif(row, args, log_path, used_names)
 
 
 def determine_final_status(slurm_state: str | None, got_data: dict[str, object], relaxed_cif_path: Path) -> str:
