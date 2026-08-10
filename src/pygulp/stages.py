@@ -113,6 +113,7 @@ def parse_got(got_path: Path) -> dict[str, object]:
     data: dict[str, object] = {
         "energy_initial_ev": None,
         "energy_final_ev": None,
+        "energy_is_nonprimitive": False,
         "volume": None,
         "volume_primitive": None,
         "volume_nonprimitive": None,
@@ -127,6 +128,8 @@ def parse_got(got_path: Path) -> dict[str, object]:
         return data
 
     energies: list[float] = []
+    primitive_energies: list[float] = []
+    nonprimitive_energies: list[float] = []
     volumes: list[str] = []
     runtime_seconds: float | None = None
     cpu_seconds: float | None = None
@@ -139,6 +142,24 @@ def parse_got(got_path: Path) -> dict[str, object]:
         )
         if energy_match:
             energies.append(float(energy_match.group(1).replace("D", "E").replace("d", "e")))
+        primitive_energy_match = re.search(
+            rf"Primitive unit cell\s*=\s*({number_pattern})\s*eV",
+            line,
+            re.I,
+        )
+        if primitive_energy_match:
+            primitive_energies.append(
+                float(primitive_energy_match.group(1).replace("D", "E").replace("d", "e"))
+            )
+        nonprimitive_energy_match = re.search(
+            rf"Non-primitive unit cell\s*=\s*({number_pattern})\s*eV",
+            line,
+            re.I,
+        )
+        if nonprimitive_energy_match:
+            nonprimitive_energies.append(
+                float(nonprimitive_energy_match.group(1).replace("D", "E").replace("d", "e"))
+            )
         primitive_volume_match = re.search(
             rf"Primitive cell volume\s*=\s*({number_pattern})",
             line,
@@ -196,6 +217,11 @@ def parse_got(got_path: Path) -> dict[str, object]:
         if "GULP has completed" in line:
             data["completed_normally"] = True
 
+    if nonprimitive_energies:
+        energies = nonprimitive_energies
+        data["energy_is_nonprimitive"] = True
+    elif primitive_energies:
+        energies = primitive_energies
     if energies:
         data["energy_initial_ev"] = energies[0]
         data["energy_final_ev"] = energies[-1]

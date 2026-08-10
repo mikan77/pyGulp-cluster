@@ -288,12 +288,27 @@ def assign_structure_ids(output_dir: Path, structures: list[Path]) -> list[tuple
         payload = json.loads(manifest_path.read_text())
         manifest = {str(path): int(identifier) for path, identifier in payload.get("structures", {}).items()}
 
+    manifest_by_basename: dict[str, int] = {}
+    duplicate_basenames: set[str] = set()
+    for path, identifier in manifest.items():
+        basename = Path(path).name
+        if basename in manifest_by_basename:
+            duplicate_basenames.add(basename)
+        else:
+            manifest_by_basename[basename] = identifier
+    for basename in duplicate_basenames:
+        manifest_by_basename.pop(basename, None)
+
     next_id = max(manifest.values(), default=0) + 1
     for path in structures:
         key = str(path.resolve())
         if key not in manifest:
-            manifest[key] = next_id
-            next_id += 1
+            existing_id = manifest_by_basename.get(path.name)
+            if existing_id is not None:
+                manifest[key] = existing_id
+            else:
+                manifest[key] = next_id
+                next_id += 1
 
     manifest_text = json.dumps({"structures": manifest}, indent=2, sort_keys=True) + "\n"
     temporary_manifest = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
@@ -1073,9 +1088,10 @@ def enrich_row_from_outputs(
     ):
         cell_multiplier = float(expected_total // actual_total)
 
+    energy_multiplier = 1.0 if got_data.get("energy_is_nonprimitive") else cell_multiplier
     for field in ("energy_initial_ev", "energy_final_ev"):
         value = got_data[field]
-        row[field] = float(value) * cell_multiplier if value is not None else None
+        row[field] = float(value) * energy_multiplier if value is not None else None
 
     nonprimitive_volume = got_data.get("volume_nonprimitive")
     primitive_volume = got_data.get("volume_primitive")
