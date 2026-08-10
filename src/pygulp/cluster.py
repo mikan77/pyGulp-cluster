@@ -972,10 +972,12 @@ def resolve_final_got_path(calc_dir: Path) -> Path:
         return calc_dir / candidate
 
     def exists_or_latest(paths: list[Path]) -> Path | None:
-        for path in paths:
-            if path.exists():
+        existing = [path for path in paths if path.exists()]
+        for path in existing:
+            parsed = parse_got(path)
+            if parsed.get("energy_final_ev") is not None:
                 return path
-        return None
+        return existing[0] if existing else None
 
     stage_plan_path = calc_dir / "stage_plan.json"
     if stage_plan_path.exists():
@@ -1060,9 +1062,31 @@ def enrich_row_from_outputs(
     expected_total = row.get("n_atoms_conventional")
     if isinstance(expected_asu, int) and isinstance(expected_total, int):
         validate_got_contract(got_data, expected_asu, expected_total, strict=validate_atom_counts)
-    row["energy_initial_ev"] = got_data["energy_initial_ev"]
-    row["energy_final_ev"] = got_data["energy_final_ev"]
-    row["volume"] = got_data["volume"]
+    cell_multiplier = 1.0
+    actual_total = got_data.get("n_atoms_total")
+    if (
+        isinstance(expected_total, int)
+        and expected_total > 0
+        and isinstance(actual_total, int)
+        and actual_total > 0
+        and expected_total % actual_total == 0
+    ):
+        cell_multiplier = float(expected_total // actual_total)
+
+    for field in ("energy_initial_ev", "energy_final_ev"):
+        value = got_data[field]
+        row[field] = float(value) * cell_multiplier if value is not None else None
+
+    nonprimitive_volume = got_data.get("volume_nonprimitive")
+    primitive_volume = got_data.get("volume_primitive")
+    if nonprimitive_volume is not None:
+        row["volume"] = float(nonprimitive_volume)
+    elif primitive_volume is not None:
+        row["volume"] = float(primitive_volume) * cell_multiplier
+    elif got_data["volume"] is not None:
+        row["volume"] = float(got_data["volume"]) * cell_multiplier
+    else:
+        row["volume"] = None
     row["runtime_seconds"] = got_data["runtime_seconds"]
 
     n_atoms = row.get("n_atoms_conventional")
@@ -1502,19 +1526,22 @@ def wait_for_jobs(
             slurm_state = final_states.get(job_id, "UNKNOWN")
             try:
                 has_stage_results = apply_stage_results(job.row, job.calc_dir)
-                if not (has_stage_results and job.row.get("failed_stage")):
-                    validate_atom_counts = _load_validate_atom_counts_flag(job.calc_dir)
-                    got_data = enrich_row_from_outputs(
-                        row=job.row,
-                        got_path=job.got_path,
-                        relaxed_cif_path=job.relaxed_cif_path,
-                        symprec=args.symprec,
-                        angle_tolerance=args.relaxed_cif_angle_tolerance,
-                        validate_atom_counts=validate_atom_counts,
-                    )
+                validate_atom_counts = _load_validate_atom_counts_flag(job.calc_dir)
+                if job.row.get("failed_stage"):
+                    validate_atom_counts = False
+                job.got_path = resolve_final_got_path(job.calc_dir)
+                got_data = enrich_row_from_outputs(
+                    row=job.row,
+                    got_path=job.got_path,
+                    relaxed_cif_path=job.relaxed_cif_path,
+                    symprec=args.symprec,
+                    angle_tolerance=args.relaxed_cif_angle_tolerance,
+                    validate_atom_counts=validate_atom_counts,
+                )
+                if not job.row.get("failed_stage"):
                     job.row["status"] = determine_final_status(slurm_state, got_data, job.relaxed_cif_path)
-                    if has_stage_results:
-                        apply_stage_results(job.row, job.calc_dir)
+                if has_stage_results:
+                    apply_stage_results(job.row, job.calc_dir)
             except Exception as exc:
                 job.row["status"] = "postprocess_failed"
                 log_message(log_path, f"[{job.index}] postprocess failed for job {job_id}: {exc!r}")
@@ -1565,6 +1592,8 @@ def collect_existing_result(index: int, poscar: Path, args, log_path: Path) -> d
     except Exception:
         pass
 
+    apply_stage_results(row, calc_dir)
+
     if got_path.exists():
         try:
             got_data = enrich_row_from_outputs(
@@ -1573,7 +1602,8 @@ def collect_existing_result(index: int, poscar: Path, args, log_path: Path) -> d
                 relaxed_cif_path=relaxed_cif_path,
                 symprec=args.symprec,
                 angle_tolerance=args.relaxed_cif_angle_tolerance,
-                validate_atom_counts=bool(row.get("validate_atom_counts", False)),
+                validate_atom_counts=bool(row.get("validate_atom_counts", False))
+                and not bool(row.get("failed_stage")),
             )
             row["status"] = determine_final_status("COMPLETED", got_data, relaxed_cif_path)
         except Exception as exc:

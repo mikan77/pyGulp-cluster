@@ -114,6 +114,8 @@ def parse_got(got_path: Path) -> dict[str, object]:
         "energy_initial_ev": None,
         "energy_final_ev": None,
         "volume": None,
+        "volume_primitive": None,
+        "volume_nonprimitive": None,
         "gnorm": None,
         "runtime_seconds": None,
         "n_atoms_irreducible": None,
@@ -128,26 +130,49 @@ def parse_got(got_path: Path) -> dict[str, object]:
     volumes: list[str] = []
     runtime_seconds: float | None = None
     cpu_seconds: float | None = None
+    number_pattern = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?"
     for line in got_path.read_text(errors="replace").splitlines():
-        energy_match = re.search(r"Total lattice energy\s*=\s*([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)\s*eV", line)
+        energy_match = re.search(
+            rf"Total lattice energy\s*=\s*({number_pattern})\s*eV",
+            line,
+            re.I,
+        )
         if energy_match:
-            energies.append(float(energy_match.group(1)))
-        volume_match = re.search(r"cell volume\s*=\s*([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)", line, re.I)
+            energies.append(float(energy_match.group(1).replace("D", "E").replace("d", "e")))
+        primitive_volume_match = re.search(
+            rf"Primitive cell volume\s*=\s*({number_pattern})",
+            line,
+            re.I,
+        )
+        if primitive_volume_match:
+            data["volume_primitive"] = float(
+                primitive_volume_match.group(1).replace("D", "E").replace("d", "e")
+            )
+        nonprimitive_volume_match = re.search(
+            rf"Non-primitive cell volume\s*=\s*({number_pattern})",
+            line,
+            re.I,
+        )
+        if nonprimitive_volume_match:
+            data["volume_nonprimitive"] = float(
+                nonprimitive_volume_match.group(1).replace("D", "E").replace("d", "e")
+            )
+        volume_match = re.search(rf"cell volume\s*=\s*({number_pattern})", line, re.I)
         if volume_match:
-            volumes.append(volume_match.group(1))
-        gnorm_match = re.search(r"Final Gnorm\s*=\s*([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)", line, re.I)
+            volumes.append(volume_match.group(1).replace("D", "E").replace("d", "e"))
+        gnorm_match = re.search(rf"Final Gnorm\s*=\s*({number_pattern})", line, re.I)
         if gnorm_match:
-            data["gnorm"] = float(gnorm_match.group(1))
+            data["gnorm"] = float(gnorm_match.group(1).replace("D", "E").replace("d", "e"))
         runtime_match = re.search(
-            r"Time to end of optimisation\s*=\s*([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)\s*seconds",
+            rf"Time to end of optimisation\s*=\s*({number_pattern})\s*seconds",
             line,
             re.I,
         )
         if runtime_match:
-            runtime_seconds = float(runtime_match.group(1))
-        cpu_match = re.search(r"Total CPU time\s+([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)", line)
+            runtime_seconds = float(runtime_match.group(1).replace("D", "E").replace("d", "e"))
+        cpu_match = re.search(rf"Total CPU time\s+({number_pattern})", line, re.I)
         if cpu_match:
-            cpu_seconds = float(cpu_match.group(1))
+            cpu_seconds = float(cpu_match.group(1).replace("D", "E").replace("d", "e"))
         irreducible_match = re.search(
             r"(?:Number of irreducible atoms/shells|Number of irreducible atoms|Number of atoms/shells in asym(?:ym)?metrical unit)\s*=\s*(\d+)",
             line,
@@ -156,7 +181,7 @@ def parse_got(got_path: Path) -> dict[str, object]:
         if irreducible_match:
             data["n_atoms_irreducible"] = int(irreducible_match.group(1))
         total_match = re.search(
-            r"(?:^\s*Total number atoms/shells\s*=|^\s*Total number of atoms\s*=|^\s*Number of atoms in unit cell\s*=|^\s*Number of atoms/shells in unit cell\s*=|^\s*Number of atoms\s*=)\s*(\d+)",
+            r"(?:^\s*Total number atoms/shells\s*=|^\s*Total number of atoms(?:/shells)?\s*=|^\s*Number of atoms in unit cell\s*=|^\s*Number of atoms/shells in unit cell\s*=|^\s*Number of atoms\s*=)\s*(\d+)",
             line,
             re.I,
         )
@@ -174,8 +199,12 @@ def parse_got(got_path: Path) -> dict[str, object]:
     if energies:
         data["energy_initial_ev"] = energies[0]
         data["energy_final_ev"] = energies[-1]
-    if volumes:
-        data["volume"] = volumes[-1]
+    if data["volume_nonprimitive"] is not None:
+        data["volume"] = data["volume_nonprimitive"]
+    elif data["volume_primitive"] is not None:
+        data["volume"] = data["volume_primitive"]
+    elif volumes:
+        data["volume"] = float(volumes[-1])
     data["runtime_seconds"] = runtime_seconds if runtime_seconds is not None else cpu_seconds
     return data
 
