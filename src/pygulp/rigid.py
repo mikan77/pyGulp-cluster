@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import csv
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,6 +21,7 @@ from pygulp.stages import parse_got
 
 DEFAULT_KEYWORDS = "gradient conp conse qok c6 gfnff gwolf noauto"
 DEFAULT_OPTIONS = "gfnff_scale 0.8 1.343 0.727 1.0 2.859\nmaths mrrr"
+GPA_A3_TO_EV = 0.006241509074
 
 
 def _exp_so3(vector: np.ndarray) -> np.ndarray:
@@ -82,14 +85,19 @@ def _apply_rigid_transform(
     groups: list[np.ndarray],
     translations: np.ndarray,
     rotations: np.ndarray,
+    cell: np.ndarray,
+    reference_centers: np.ndarray,
+    center_fractions: np.ndarray,
 ) -> Atoms:
     atoms = reference.copy()
     positions = reference.get_positions().copy()
     for group_index, group in enumerate(groups):
         indices = np.asarray(group, dtype=int)
-        center = positions[indices].mean(axis=0)
-        positions[indices] = (positions[indices] - center) @ rotations[group_index].T + center
+        center = center_fractions[group_index] @ cell
+        local_positions = reference.get_positions()[indices] - reference_centers[group_index]
+        positions[indices] = local_positions @ rotations[group_index].T + center
         positions[indices] += translations[group_index]
+    atoms.set_cell(cell)
     atoms.set_positions(positions)
     return atoms
 
@@ -214,6 +222,12 @@ def run_rigid_gfnff_stage(
     spacegroup_number: int,
 ) -> dict[str, object]:
     options = dict(stage.get("rigid") or {})
+    cell_mode = str(options.get("cell_mode", "isotropic")).strip().lower()
+    if cell_mode != "isotropic":
+        raise ValueError(
+            "rigid_gfnff now requires rigid.cell_mode=isotropic; fixed-cell mode has been removed"
+        )
+
     atoms, groups, detected_spacegroup, scope = _select_scope(
         calc_dir,
         options,
@@ -223,8 +237,28 @@ def run_rigid_gfnff_stage(
         detected_spacegroup = 1
 
     keywords = str(stage.get("keywords") or DEFAULT_KEYWORDS).strip()
+    keyword_words = keywords.lower().split()
+    if "conv" in keyword_words:
+        raise ValueError("rigid_gfnff requires conp; conv/fixed-cell mode is no longer supported")
+    if "conp" not in keyword_words:
+        keywords = f"{keywords}\nconp"
+        keyword_words = keywords.lower().split()
     if "gradient" not in keywords.lower().split():
         keywords = f"gradient {keywords}"
+
+    pressure_match = re.search(
+        r"\bpressure\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?)\s*GPa\b",
+        keywords,
+        re.IGNORECASE,
+    )
+    if "target_pressure_gpa" in options:
+        target_pressure_gpa = float(options["target_pressure_gpa"])
+    elif pressure_match:
+        target_pressure_gpa = float(pressure_match.group(1))
+    else:
+        target_pressure_gpa = 0.0
+        keywords = f"{keywords}\npressure 0 GPa"
+
     stage_options = "\n".join(
         line
         for line in str(stage.get("options") or "").splitlines()
@@ -249,77 +283,199 @@ def run_rigid_gfnff_stage(
     rotation_step = float(options.get("rotation_step", 0.00005))
     force_tolerance = float(options.get("force_tolerance", 0.0))
     torque_tolerance = float(options.get("torque_tolerance", 0.0))
+    cell_gradient_tolerance = float(options.get("cell_gradient_tolerance", 0.0))
     energy_tolerance = float(options.get("energy_tolerance", 0.0))
     patience = max(1, int(options.get("patience", 5)))
+    cell_step = float(options.get("cell_step", 5.0e-6))
+    max_cell_change = abs(float(options.get("max_cell_change", 0.01)))
+    backtrack_factor = float(options.get("backtrack_factor", 0.5))
+    objective_tolerance = float(options.get("objective_tolerance", 1.0e-8))
+    if cell_step <= 0.0 or max_cell_change <= 0.0:
+        raise ValueError("rigid.cell_step and rigid.max_cell_change must be positive")
+    if not 0.0 < backtrack_factor < 1.0:
+        raise ValueError("rigid.backtrack_factor must be between 0 and 1")
 
     reference = atoms.copy()
     _unwrap_groups(reference, groups)
+    reference_cell = np.asarray(reference.cell, dtype=float).copy()
+    reference_positions = reference.get_positions().copy()
+    reference_centers = np.array(
+        [reference_positions[group].mean(axis=0) for group in groups],
+        dtype=float,
+    )
+    center_fractions = reference_centers @ np.linalg.inv(reference_cell)
+    cell = reference_cell.copy()
     translations = np.zeros((len(groups), 3), dtype=float)
     rotations = np.repeat(np.eye(3)[None, :, :], len(groups), axis=0)
     best_energy: float | None = None
+    best_objective: float | None = None
     best_step = 0
     best_atoms: Atoms | None = None
     best_got: Path | None = None
     previous_energy: float | None = None
     stable_steps = 0
+    accepted_energy: float | None = None
+    accepted_objective: float | None = None
+    accepted_translations = translations.copy()
+    accepted_rotations = rotations.copy()
+    accepted_cell = cell.copy()
     converged = False
     last_data: dict[str, object] = {}
+    step_log_path = calc_dir / "rigid_steps.csv"
+    step_log = step_log_path.open("w", newline="")
+    step_writer = csv.DictWriter(
+        step_log,
+        fieldnames=[
+            "step",
+            "energy_ev",
+            "enthalpy_ev",
+            "volume_a3",
+            "max_force",
+            "max_torque",
+            "cell_gradient",
+            "cell_scale",
+            "accepted",
+        ],
+    )
+    step_writer.writeheader()
 
     for step in range(1, steps + 1):
-        current = _apply_rigid_transform(reference, groups, translations, rotations)
+        current = _apply_rigid_transform(
+            reference,
+            groups,
+            translations,
+            rotations,
+            cell,
+            reference_centers,
+            center_fractions,
+        )
         iteration_prefix = f"{stage['prefix']}_step_{step:04d}"
         gin_path = calc_dir / f"{iteration_prefix}.gin"
         got_path = calc_dir / f"{iteration_prefix}.got"
         gin_path.write_text(_render_input(current, keywords, input_options, detected_spacegroup))
         returncode = _run_gulp(gulp_command, iteration_prefix, calc_dir)
         if returncode != 0:
+            step_log.close()
             raise RuntimeError(f"GULP rigid iteration returned exit code {returncode}")
 
         raw = read_results(str(got_path))
         energies = raw.get("energy") or []
         gradient = np.asarray(raw.get("gradient"), dtype=float)
-        if not energies or gradient.ndim != 2 or gradient.shape[0] != len(current):
-            raise RuntimeError(f"Could not read rigid GFNFF gradient from {got_path.name}")
+        cell_gradient_tensor = np.asarray(raw.get("strain"), dtype=float)
+        if (
+            not energies
+            or gradient.ndim != 2
+            or gradient.shape[0] != len(current)
+            or cell_gradient_tensor.shape != (3, 3)
+            or not np.all(np.isfinite(cell_gradient_tensor))
+        ):
+            step_log.close()
+            raise RuntimeError(f"Could not read rigid GFNFF gradients from {got_path.name}")
+
+        try:
+            volume = float(raw.get("volume"))
+        except (TypeError, ValueError):
+            step_log.close()
+            raise RuntimeError(f"Could not read cell volume from {got_path.name}")
         energy = float(energies[-1])
-        if best_energy is None or energy < best_energy:
-            best_energy = energy
-            best_step = step
-            best_atoms = current.copy()
-            best_got = got_path
+        objective = energy + target_pressure_gpa * volume * GPA_A3_TO_EV
+        cell_gradient_tensor = 0.5 * (cell_gradient_tensor + cell_gradient_tensor.T)
+        cell_gradient = float(np.trace(cell_gradient_tensor) / 3.0)
 
         inverse_cell = np.linalg.inv(np.asarray(current.cell))
         forces = -(gradient @ inverse_cell)
         molecule_forces = np.array([np.sum(forces[group], axis=0) for group in groups])
-        centers = np.array([current.get_positions()[group].mean(axis=0) for group in groups])
+        current_positions = current.get_positions()
+        centers = np.array([current_positions[group].mean(axis=0) for group in groups])
         torques = np.array(
-            [np.sum(np.cross(current.get_positions()[group] - center, forces[group]), axis=0) for group, center in zip(groups, centers)]
+            [
+                np.sum(np.cross(current_positions[group] - center, forces[group]), axis=0)
+                for group, center in zip(groups, centers)
+            ]
         )
         max_force = float(max(np.linalg.norm(value) for value in molecule_forces))
         max_torque = float(max(np.linalg.norm(value) for value in torques))
-        last_data = {
-            "energy_initial_ev": energy,
-            "energy_final_ev": energy,
-            "volume": raw.get("volume"),
-            "steps_completed": step,
-            "max_force": max_force,
-            "max_torque": max_torque,
-        }
 
-        if previous_energy is not None and energy_tolerance > 0.0:
-            stable_steps = stable_steps + 1 if abs(energy - previous_energy) <= energy_tolerance else 0
-        previous_energy = energy
-        if (
-            force_tolerance > 0.0
-            and torque_tolerance > 0.0
-            and max_force <= force_tolerance
-            and max_torque <= torque_tolerance
-        ) or stable_steps >= patience:
-            converged = True
+        accepted = accepted_objective is None or objective <= accepted_objective + objective_tolerance
+        if not accepted:
+            translations = accepted_translations.copy()
+            rotations = accepted_rotations.copy()
+            cell = accepted_cell.copy()
+            translation_step *= backtrack_factor
+            rotation_step *= backtrack_factor
+            cell_step *= backtrack_factor
+        else:
+            accepted_energy = energy
+            accepted_objective = objective
+            accepted_translations = translations.copy()
+            accepted_rotations = rotations.copy()
+            accepted_cell = cell.copy()
+            if best_objective is None or objective < best_objective:
+                best_objective = objective
+                best_energy = energy
+                best_step = step
+                best_atoms = current.copy()
+                best_got = got_path
+
+            last_data = {
+                "energy_initial_ev": energy,
+                "energy_final_ev": energy,
+                "volume": volume,
+                "steps_completed": step,
+                "max_force": max_force,
+                "max_torque": max_torque,
+                "cell_gradient": cell_gradient,
+                "cell_mode": cell_mode,
+                "target_pressure_gpa": target_pressure_gpa,
+            }
+
+            if previous_energy is not None and energy_tolerance > 0.0:
+                stable_steps = stable_steps + 1 if abs(energy - previous_energy) <= energy_tolerance else 0
+            previous_energy = energy
+            cell_ok = (
+                cell_gradient_tolerance > 0.0
+                and abs(cell_gradient) <= cell_gradient_tolerance
+            )
+            if (
+                force_tolerance > 0.0
+                and torque_tolerance > 0.0
+                and cell_ok
+                and max_force <= force_tolerance
+                and max_torque <= torque_tolerance
+            ) or stable_steps >= patience:
+                converged = True
+
+        cell_scale = 1.0
+        if accepted and not converged:
+            translations += translation_step * molecule_forces
+            for index, torque in enumerate(torques):
+                rotations[index] = _exp_so3(rotation_step * torque) @ rotations[index]
+
+            cell_change = float(np.clip(cell_step * cell_gradient, -max_cell_change, max_cell_change))
+            cell_scale = 1.0 - cell_change
+            if cell_scale <= 0.0:
+                step_log.close()
+                raise RuntimeError("Rigid cell update produced a non-positive cell scale")
+            cell = cell_scale * cell
+
+        step_writer.writerow(
+            {
+                "step": step,
+                "energy_ev": energy,
+                "enthalpy_ev": objective,
+                "volume_a3": volume,
+                "max_force": max_force,
+                "max_torque": max_torque,
+                "cell_gradient": cell_gradient,
+                "cell_scale": cell_scale,
+                "accepted": accepted,
+            }
+        )
+        step_log.flush()
+        if converged:
             break
 
-        translations += translation_step * molecule_forces
-        for index, torque in enumerate(torques):
-            rotations[index] = _exp_so3(rotation_step * torque) @ rotations[index]
+    step_log.close()
 
     if best_atoms is None or best_got is None or best_energy is None:
         raise RuntimeError("Rigid GFNFF stage produced no usable energy")
