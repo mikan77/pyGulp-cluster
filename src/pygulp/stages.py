@@ -5,7 +5,7 @@ import json
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -16,6 +16,8 @@ class StageSpec:
     options: str
     require_convergence: bool = True
     validate_atom_counts: bool = False
+    mode: str = "gulp"
+    rigid_options: dict[str, object] = field(default_factory=dict)
 
     @property
     def prefix(self) -> str:
@@ -23,6 +25,8 @@ class StageSpec:
 
     @property
     def is_optimisation(self) -> bool:
+        if self.mode == "rigid_gfnff":
+            return True
         words = set(re.findall(r"[A-Za-z_]+", self.keywords.lower()))
         return bool(words & {"opti", "optimise", "optimize"})
 
@@ -76,10 +80,16 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
         if not isinstance(entry, dict):
             raise ValueError(f"Stage #{index} must be a mapping")
         raw_name = entry.get("name")
+        mode = str(entry.get("mode", "gulp")).strip().lower()
+        if mode not in {"gulp", "rigid_gfnff"}:
+            raise ValueError(f"Stage #{index} has unsupported mode: {mode}")
         keywords = entry.get("keywords")
+        if mode == "rigid_gfnff" and keywords is None:
+            keywords = "gradient conp conse qok c6 gfnff gwolf noauto"
         options = entry.get("options", default_options)
-        require_convergence = entry.get("require_convergence", True)
+        require_convergence = entry.get("require_convergence", False if mode == "rigid_gfnff" else True)
         validate_atom_counts = entry.get("validate_atom_counts", default_validate_atom_counts)
+        rigid_options = entry.get("rigid", {})
         if not isinstance(raw_name, str) or not isinstance(keywords, str) or not keywords.strip():
             raise ValueError(f"Stage #{index} requires non-empty string fields 'name' and 'keywords'")
         if not isinstance(options, str):
@@ -88,6 +98,8 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
             raise ValueError(f"Stage #{index} field 'require_convergence' must be true or false")
         if not isinstance(validate_atom_counts, bool):
             raise ValueError(f"Stage #{index} field 'validate_atom_counts' must be true or false")
+        if not isinstance(rigid_options, dict):
+            raise ValueError(f"Stage #{index} field 'rigid' must be a mapping")
         cleaned_name = sanitize_stage_name(raw_name)
         if cleaned_name in used_names:
             raise ValueError(f"Duplicate stage name: {raw_name}")
@@ -100,6 +112,8 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
                 options=options.rstrip(),
                 require_convergence=require_convergence,
                 validate_atom_counts=validate_atom_counts,
+                mode=mode,
+                rigid_options=dict(rigid_options),
             )
         )
 
@@ -303,7 +317,12 @@ def _managed_option_heads(stages: list[dict[str, object]]) -> set[str]:
     return heads
 
 
-def rewrite_restart(restart_text: str, stage: dict[str, object], managed_heads: set[str]) -> str:
+def rewrite_restart(
+    restart_text: str,
+    stage: dict[str, object],
+    managed_heads: set[str],
+    library_name: str | None = None,
+) -> str:
     lines = restart_text.splitlines()
     title_index = next((index for index, line in enumerate(lines) if line.strip().lower() == "title"), None)
     if title_index is None:
@@ -317,6 +336,8 @@ def rewrite_restart(restart_text: str, stage: dict[str, object], managed_heads: 
         filtered.append(line)
 
     kept = [*str(stage["keywords"]).splitlines(), *filtered]
+    if library_name and not any(line.strip().lower().startswith("library ") for line in kept):
+        kept.append(f"library {library_name}")
     options = str(stage.get("options", "")).rstrip()
     if options:
         kept.extend(["", options])
@@ -324,6 +345,16 @@ def rewrite_restart(restart_text: str, stage: dict[str, object], managed_heads: 
     if bool(stage.get("needs_restart")):
         kept.append(f"dump {stage['prefix']}.grs")
     return "\n".join(kept).rstrip() + "\n"
+
+
+def _without_connect_options(stage: dict[str, object]) -> dict[str, object]:
+    cleaned = dict(stage)
+    cleaned["options"] = "\n".join(
+        line
+        for line in str(stage.get("options", "")).splitlines()
+        if not (line.strip() and line.split()[0].lower() == "connect")
+    )
+    return cleaned
 
 
 def write_stage_results(calc_dir: Path, rows: list[dict[str, object]]) -> None:
@@ -376,26 +407,64 @@ def execute_stage_plan(plan_path: Path) -> int:
                 if stale_path.exists():
                     stale_path.unlink()
             if index:
-                previous_restart = calc_dir / f"{stages[index - 1]['prefix']}.grs"
-                if not previous_restart.exists():
-                    raise FileNotFoundError(f"Previous stage restart is missing: {previous_restart.name}")
-                gin_path.write_text(rewrite_restart(previous_restart.read_text(), stage, managed_heads))
+                previous_stage = stages[index - 1]
+                if previous_stage.get("mode") == "rigid_gfnff":
+                    previous_input = calc_dir / f"{previous_stage['prefix']}.gin"
+                    if not previous_input.exists():
+                        raise FileNotFoundError(f"Previous rigid stage input is missing: {previous_input.name}")
+                    plan_library = plan.get("library_name")
+                    gin_path.write_text(
+                        rewrite_restart(
+                            previous_input.read_text(),
+                            _without_connect_options(stage),
+                            managed_heads - {"connect"},
+                            library_name=(
+                                str(plan_library)
+                                if plan_library
+                                and "reaxff" in str(stage.get("keywords", "")).lower().split()
+                                else None
+                            ),
+                        )
+                    )
+                else:
+                    previous_restart = calc_dir / f"{previous_stage['prefix']}.grs"
+                    if not previous_restart.exists():
+                        raise FileNotFoundError(f"Previous stage restart is missing: {previous_restart.name}")
+                    gin_path.write_text(rewrite_restart(previous_restart.read_text(), stage, managed_heads))
 
-            command = str(plan["gulp_command"]).replace("PREFIX", prefix)
-            completed = subprocess.run(command, cwd=calc_dir, shell=True, check=False)
-            data = parse_got(got_path)
-            row.update({key: data.get(key) for key in STAGE_RESULT_FIELDS if key in data})
-            if validate_atom_counts:
-                validate_got_contract(data, expected_asu, expected_total)
-            if completed.returncode != 0:
-                raise RuntimeError(f"GULP command returned exit code {completed.returncode}")
-            require_convergence = bool(stage.get("require_convergence", True))
-            if require_convergence and not data.get("completed_normally"):
-                raise RuntimeError("GULP did not report normal completion")
-            converged = not bool(stage["is_optimisation"]) or data.get("gulp_status") == "optimisation_achieved"
-            row["converged"] = converged
-            if bool(stage["is_optimisation"]) and require_convergence and not converged:
-                raise RuntimeError(str(data.get("gulp_status") or "optimisation did not converge"))
+            if stage.get("mode") == "rigid_gfnff":
+                from pygulp.rigid import run_rigid_gfnff_stage
+
+                data = run_rigid_gfnff_stage(
+                    calc_dir=calc_dir,
+                    stage=stage,
+                    gulp_command=str(plan["gulp_command"]),
+                    spacegroup_number=int(plan["spacegroup_number"]),
+                )
+                row.update({key: data.get(key) for key in STAGE_RESULT_FIELDS if key in data})
+                row["rigid_scope"] = data.get("rigid_scope")
+                row["rigid_steps_completed"] = data.get("rigid_steps_completed")
+                converged = bool(data.get("converged"))
+                row["converged"] = converged
+                require_convergence = bool(stage.get("require_convergence", False))
+                if require_convergence and not converged:
+                    raise RuntimeError("Rigid GFNFF stage did not reach force/torque/energy tolerance")
+            else:
+                command = str(plan["gulp_command"]).replace("PREFIX", prefix)
+                completed = subprocess.run(command, cwd=calc_dir, shell=True, check=False)
+                data = parse_got(got_path)
+                row.update({key: data.get(key) for key in STAGE_RESULT_FIELDS if key in data})
+                if validate_atom_counts:
+                    validate_got_contract(data, expected_asu, expected_total)
+                if completed.returncode != 0:
+                    raise RuntimeError(f"GULP command returned exit code {completed.returncode}")
+                require_convergence = bool(stage.get("require_convergence", True))
+                if require_convergence and not data.get("completed_normally"):
+                    raise RuntimeError("GULP did not report normal completion")
+                converged = not bool(stage["is_optimisation"]) or data.get("gulp_status") == "optimisation_achieved"
+                row["converged"] = converged
+                if bool(stage["is_optimisation"]) and require_convergence and not converged:
+                    raise RuntimeError(str(data.get("gulp_status") or "optimisation did not converge"))
             if stage.get("needs_restart") and not restart_path.exists():
                 raise FileNotFoundError(f"GULP did not write restart file {restart_path.name}")
 

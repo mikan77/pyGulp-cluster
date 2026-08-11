@@ -710,7 +710,9 @@ def build_stage_plan(
                 "is_optimisation": stage.is_optimisation,
                 "require_convergence": stage.require_convergence,
                 "validate_atom_counts": stage.validate_atom_counts,
-                "needs_restart": index < len(stages) - 1,
+                "mode": stage.mode,
+                "rigid": stage.rigid_options,
+                "needs_restart": index < len(stages) - 1 and stage.mode != "rigid_gfnff",
             }
         )
 
@@ -737,6 +739,7 @@ def build_stage_plan(
         "n_atoms_asu": len(asu_atoms),
         "n_atoms_conventional": n_atoms_conventional,
         "spacegroup_number": spacegroup_number,
+        "library_name": library_name,
         "validate_atom_counts": all(stage["validate_atom_counts"] for stage in stage_payloads),
         "gulp_command": stage_gulp_command(args),
         "stages": stage_payloads,
