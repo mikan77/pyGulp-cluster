@@ -140,6 +140,7 @@ def _render_input(
     keywords: str,
     options: str,
     spacegroup_number: int,
+    library_name: str | None = None,
 ) -> str:
     lines = [keywords.rstrip(), "title", "pyGulp rigid GFNFF", "end", ""]
     lines.append("cell")
@@ -156,6 +157,8 @@ def _render_input(
             f"{position[2]:10.7f}  {charge:10.5f}"
         )
     lines.extend(["", "spacegroup", str(int(spacegroup_number)), ""])
+    if library_name:
+        lines.append(f"library {library_name}")
     if options.strip():
         lines.append(options.rstrip())
     return "\n".join(lines).rstrip() + "\n"
@@ -213,6 +216,147 @@ def _select_scope(
     selected.set_tags([unique_tags[int(tag)] for tag in local_tags])
     groups = [np.where(np.asarray(selected.get_tags()) == tag)[0] for tag in sorted(set(selected.get_tags().tolist()))]
     return selected, groups, spacegroup_number, "asu"
+
+
+def _resymmetrize_full_cell(
+    full: Atoms,
+    groups: list[np.ndarray],
+    calc_dir: Path,
+    prefix: str,
+    options: dict[str, object],
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "rigid_resymmetrized": False,
+        "rigid_spacegroup_number": 1,
+    }
+    if not bool(options.get("resymmetrize_after", True)):
+        result["resymmetrization_status"] = "disabled"
+        return result
+
+    try:
+        from pymatgen.io.ase import AseAtomsAdaptor
+        from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+
+        symprec = float(options.get("symmetry_tolerance", 0.01))
+        angle_tolerance = float(options.get("angle_tolerance", 5.0))
+        structure = AseAtomsAdaptor.get_structure(full)
+        analyzer = SpacegroupAnalyzer(
+            structure,
+            symprec=symprec,
+            angle_tolerance=angle_tolerance,
+        )
+        spacegroup_number = int(analyzer.get_space_group_number())
+        result["rigid_spacegroup_number"] = spacegroup_number
+        result["rigid_spacegroup_symbol"] = str(analyzer.get_space_group_symbol())
+        if spacegroup_number == 1:
+            result["resymmetrization_status"] = "p1_only"
+            return result
+
+        symmetrized = analyzer.get_symmetrized_structure()
+        unique_indices = [int(indices[0]) for indices in symmetrized.equivalent_indices]
+        asu_structure = symmetrized.structure[unique_indices]
+        symmetrized_full = AseAtomsAdaptor.get_atoms(symmetrized.structure)
+        asu = AseAtomsAdaptor.get_atoms(asu_structure)
+        symmetrized_full.set_pbc([True, True, True])
+        asu.set_pbc([True, True, True])
+
+        if len(symmetrized_full) != len(full):
+            result["resymmetrization_status"] = "atom_count_changed"
+            return result
+
+        mapped = _match_asu_to_full(asu, full, tolerance=max(0.05, symprec * 5.0))
+        asu_set = set(mapped)
+        if bool(options.get("require_molecular_consistency", True)):
+            for group in groups:
+                group_set = set(int(index) for index in group)
+                if group_set.intersection(asu_set) and not group_set.issubset(asu_set):
+                    result["resymmetrization_status"] = "molecule_split"
+                    return result
+
+        full_path = calc_dir / f"{prefix}_resymmetrized_full.cif"
+        asu_path = calc_dir / f"{prefix}_resymmetrized_asymmetric_unit.cif"
+        symmetry_path = calc_dir / f"{prefix}_resymmetrized_symmetry.json"
+        write(full_path, symmetrized_full, format="cif")
+        write(asu_path, asu, format="cif")
+        symmetry_path.write_text(
+            json.dumps(
+                {
+                    "gulp_spacegroup_number": spacegroup_number,
+                    "spacegroup_symbol": str(analyzer.get_space_group_symbol()),
+                    "symprec": symprec,
+                    "angle_tolerance": angle_tolerance,
+                    "source": "rigid_resymmetrization",
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        result.update(
+            {
+                "rigid_resymmetrized": True,
+                "resymmetrization_status": "success",
+                "resymmetrized_full_cif": full_path.name,
+                "resymmetrized_asu_cif": asu_path.name,
+                "resymmetrized_symmetry_json": symmetry_path.name,
+                "rigid_spacegroup_number": spacegroup_number,
+            }
+        )
+        return result
+    except Exception as exc:
+        result["resymmetrization_status"] = "failed"
+        result["resymmetrization_error"] = repr(exc)
+        return result
+
+
+def build_resymmetrized_stage_input(
+    calc_dir: Path,
+    stage: dict[str, object],
+    spacegroup_number: int,
+    library_name: str | None = None,
+) -> str:
+    asu_path = calc_dir / f"{stage['prefix'].replace('_' + str(stage['name']).split('_', 1)[-1], '')}_resymmetrized_asymmetric_unit.cif"
+    candidates = sorted(calc_dir.glob("*_resymmetrized_asymmetric_unit.cif"))
+    if candidates:
+        asu_path = candidates[-1]
+    if not asu_path.exists():
+        raise FileNotFoundError(f"Resymmetrized ASU file not found in {calc_dir}")
+
+    asu = read(asu_path)
+    asu.set_pbc([True, True, True])
+    tags = infer_molecule_tags_natural_cutoffs(asu, include_periodic_bonds=True, mult=1.1)
+    asu.set_tags(tags)
+    connections = infer_natural_cutoff_connections(
+        asu,
+        molecule_tag=None,
+        same_tag_only=True,
+        include_periodic_bonds=True,
+        index_base=1,
+        local_indexing=False,
+        mult=1.1,
+    )
+    stage_options = "\n".join(
+        line
+        for line in str(stage.get("options") or "").splitlines()
+        if not (line.strip() and line.split()[0].lower() == "connect")
+    ).strip()
+    generated = "\n".join(
+        part
+        for part in (
+            stage_options,
+            "\n".join(f"connect {first} {second}" for first, second in connections),
+            f"output movie cif {stage['prefix']}.cif",
+            f"dump {stage['prefix']}.grs" if bool(stage.get("needs_restart")) else "",
+        )
+        if part
+    )
+    if "reaxff" in str(stage.get("keywords", "")).lower().split() and library_name:
+        generated = f"library {library_name}\n{generated}"
+    return _render_input(
+        asu,
+        str(stage["keywords"]),
+        generated,
+        int(spacegroup_number),
+    )
 
 
 def run_rigid_gfnff_stage(
@@ -488,6 +632,18 @@ def run_rigid_gfnff_stage(
     output_atoms = _expand_asu(best_atoms, detected_spacegroup) if scope == "asu" else best_atoms
     write(final_cif, output_atoms, format="cif")
 
+    resymmetrization = _resymmetrize_full_cell(
+        best_atoms,
+        groups,
+        calc_dir,
+        str(stage["prefix"]),
+        options,
+    ) if scope == "full_cell" else {
+        "rigid_resymmetrized": False,
+        "resymmetrization_status": "already_asu",
+        "rigid_spacegroup_number": detected_spacegroup,
+    }
+
     parsed = parse_got(final_got)
     last_data.update(
         {
@@ -501,4 +657,5 @@ def run_rigid_gfnff_stage(
             "rigid_steps_completed": int(last_data.get("steps_completed", steps)),
         }
     )
+    last_data.update(resymmetrization)
     return last_data

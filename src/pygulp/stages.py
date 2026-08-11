@@ -409,23 +409,36 @@ def execute_stage_plan(plan_path: Path) -> int:
             if index:
                 previous_stage = stages[index - 1]
                 if previous_stage.get("mode") == "rigid_gfnff":
-                    previous_input = calc_dir / f"{previous_stage['prefix']}.gin"
-                    if not previous_input.exists():
-                        raise FileNotFoundError(f"Previous rigid stage input is missing: {previous_input.name}")
                     plan_library = plan.get("library_name")
-                    gin_path.write_text(
-                        rewrite_restart(
-                            previous_input.read_text(),
-                            _without_connect_options(stage),
-                            managed_heads - {"connect"},
-                            library_name=(
-                                str(plan_library)
-                                if plan_library
-                                and "reaxff" in str(stage.get("keywords", "")).lower().split()
-                                else None
-                            ),
+                    previous_row = results[index - 1]
+                    if previous_row.get("rigid_resymmetrized"):
+                        from pygulp.rigid import build_resymmetrized_stage_input
+
+                        gin_path.write_text(
+                            build_resymmetrized_stage_input(
+                                calc_dir=calc_dir,
+                                stage=stage,
+                                spacegroup_number=int(previous_row["rigid_spacegroup_number"]),
+                                library_name=str(plan_library) if plan_library else None,
+                            )
                         )
-                    )
+                    else:
+                        previous_input = calc_dir / f"{previous_stage['prefix']}.gin"
+                        if not previous_input.exists():
+                            raise FileNotFoundError(f"Previous rigid stage input is missing: {previous_input.name}")
+                        gin_path.write_text(
+                            rewrite_restart(
+                                previous_input.read_text(),
+                                _without_connect_options(stage),
+                                managed_heads - {"connect"},
+                                library_name=(
+                                    str(plan_library)
+                                    if plan_library
+                                    and "reaxff" in str(stage.get("keywords", "")).lower().split()
+                                    else None
+                                ),
+                            )
+                        )
                 else:
                     previous_restart = calc_dir / f"{previous_stage['prefix']}.grs"
                     if not previous_restart.exists():
@@ -444,6 +457,9 @@ def execute_stage_plan(plan_path: Path) -> int:
                 row.update({key: data.get(key) for key in STAGE_RESULT_FIELDS if key in data})
                 row["rigid_scope"] = data.get("rigid_scope")
                 row["rigid_steps_completed"] = data.get("rigid_steps_completed")
+                row["rigid_resymmetrized"] = data.get("rigid_resymmetrized", False)
+                row["rigid_spacegroup_number"] = data.get("rigid_spacegroup_number")
+                row["resymmetrization_status"] = data.get("resymmetrization_status")
                 converged = bool(data.get("converged"))
                 row["converged"] = converged
                 require_convergence = bool(stage.get("require_convergence", False))
