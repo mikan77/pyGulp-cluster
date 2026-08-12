@@ -231,16 +231,12 @@ def _run_gulp(command_template: str, prefix: str, calc_dir: Path) -> int:
 
 def _prepare_keywords(stage_keywords: str, options: dict[str, object]) -> tuple[str, float]:
     forbidden = {"opti", "optimise", "optimize", "rigid", "molecule", "spacegroup", "conv"}
-    lines = []
-    for line in stage_keywords.splitlines():
-        kept = [word for word in line.split() if word.lower() not in forbidden]
-        if kept:
-            lines.append(" ".join(kept))
-    keywords = "\n".join(lines).strip()
+    words = [word for word in stage_keywords.split() if word.lower() not in forbidden]
+    keywords = " ".join(words).strip()
     if "gradient" not in keywords.lower().split():
         keywords = f"gradient {keywords}".strip()
     if "conp" not in keywords.lower().split():
-        keywords += "\nconp"
+        keywords += " conp"
     match = re.search(r"\bpressure\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?)\s*GPa\b", keywords, re.I)
     if "target_pressure_gpa" in options:
         pressure = float(options["target_pressure_gpa"])
@@ -248,7 +244,7 @@ def _prepare_keywords(stage_keywords: str, options: dict[str, object]) -> tuple[
         pressure = float(match.group(1))
     else:
         pressure = 0.0
-        keywords += "\npressure 0 GPa"
+        keywords += " pressure 0 GPa"
     return keywords, pressure
 
 
@@ -560,5 +556,5 @@ def build_symmetric_stage_input(
     ) if part)
     if library_name and "reaxff" in str(stage.get("keywords", "")).lower().split():
         generated = f"library {library_name}\n{generated}"
-    keywords = f"{stage['keywords'].rstrip()}\nspacegroup {int(spacegroup_number)}"
+    keywords = f"{' '.join(str(stage['keywords']).split())} spacegroup {int(spacegroup_number)}"
     return _render_input(asu, keywords, generated)
