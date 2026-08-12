@@ -557,7 +557,8 @@ def build_symmetric_stage_input(
     generated = "\n".join(part for part in (
         options,
         "\n".join(f"connect {first} {second}" for first, second in connections),
-        f"spacegroup {int(spacegroup_number)}",
+        "spacegroup",
+        str(int(spacegroup_number)),
         f"output movie cif {stage['prefix']}.cif",
         f"dump {stage['prefix']}.grs" if bool(stage.get("needs_restart")) else "",
     ) if part)
