@@ -27,40 +27,33 @@ def read_results(GULP_output):
                     if 'Primitive cell' in text[v]:
                         break
             elif 'Total lattice energy' in text[line]:
-                if '=' in text[line]:
-                    total = text[line].split('=')
-                    energy = total[-1].split()[0]
-                else:
-                    total = text[line+2].split('=')
-                    energy = total[-1].split()[0]
-
-
-                try:
-                    energy_lis.append(float(energy))
-                except:
-                    print('No energy present')
+                match = re.search(
+                    r'=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?)\s+eV\b',
+                    text[line],
+                    re.IGNORECASE,
+                )
+                if match:
+                    energy_lis.append(float(match.group(1).replace('D', 'E').replace('d', 'e')))
             elif 'cell volume' in text[line]:
                 if '=' in text[line]:
                     total = text[line].split('=')
                     volume = total[-1].split()[0]
                 else:
                     volume = 0
-    # print(energy_lis)
 
     fixed_inter_dev = re.sub(r'(?<=\d)-(?=\d)', ' -', internal_dev)
     df_gradient = pd.read_csv(io.StringIO(fixed_inter_dev),
-                     sep='\s+',
-                     skipfooter=1,
-                     header=None,
-                     engine='python')
-    # print(df_gradient)
+                              sep='\s+',
+                              skipfooter=1,
+                              header=None,
+                              engine='python')
 
     df_strain = pd.read_csv(io.StringIO(cell_dev),
-                              sep='\s+',
-                            skiprows=3,
-                              skipfooter=3,
-                              header=None,
-                            engine='python')
+                             sep='\s+',
+                             skiprows=3,
+                             skipfooter=3,
+                             header=None,
+                             engine='python')
 
     gradient_array = df_gradient.to_numpy()
     strains_array = df_strain.to_numpy()
@@ -73,14 +66,13 @@ def read_results(GULP_output):
 
     gradient = gradient_array[:,3:6]
 
+    return {
+        'strain': eps_tensor,
+        'gradient': gradient.astype(float),
+        'energy': energy_lis,
+        'volume': volume,
+    }
 
-    result = {'strain': eps_tensor,
-              'gradient': gradient.astype(float) ,
-              'energy': energy_lis,
-              'volume':volume}
-
-
-    return result
 
 def consecutive_gulp_read(path_exper):
     experiments = os.listdir(path_exper)
@@ -110,4 +102,3 @@ def consecutive_gulp_read(path_exper):
                     print(f' for {value}',f_energy, f_Gnorm)
 
         print(gulps)
-

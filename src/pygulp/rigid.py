@@ -511,6 +511,12 @@ def run_rigid_gfnff_symmetry_stage(calc_dir: Path, stage: dict[str, object], gul
         "n_asu_atoms": len(final_asu), "n_full_atoms": len(final_full),
         "special_positions": bool(special), "source": "symmetry_constrained_rigid_gfnff",
     }, indent=2) + "\n")
+    required_outputs = (final_gin, final_got, final_cif, final_asu_cif)
+    missing_outputs = [path.name for path in required_outputs if not path.is_file()]
+    if missing_outputs:
+        raise RuntimeError(
+            "Rigid stage did not create required final files: " + ", ".join(missing_outputs)
+        )
     final_raw = read_results(str(final_got))
     energies = final_raw.get("energy") or [best_energy]
     return {
@@ -551,10 +557,11 @@ def build_symmetric_stage_input(
     generated = "\n".join(part for part in (
         options,
         "\n".join(f"connect {first} {second}" for first, second in connections),
+        f"spacegroup {int(spacegroup_number)}",
         f"output movie cif {stage['prefix']}.cif",
         f"dump {stage['prefix']}.grs" if bool(stage.get("needs_restart")) else "",
     ) if part)
     if library_name and "reaxff" in str(stage.get("keywords", "")).lower().split():
         generated = f"library {library_name}\n{generated}"
-    keywords = f"{' '.join(str(stage['keywords']).split())} spacegroup {int(spacegroup_number)}"
+    keywords = " ".join(str(stage["keywords"]).split())
     return _render_input(asu, keywords, generated)

@@ -48,6 +48,7 @@ STAGE_RESULT_FIELDS = (
     "got",
     "cif",
     "restart",
+    "rigid_steps_completed",
     "message",
 )
 
@@ -417,6 +418,11 @@ def execute_stage_plan(plan_path: Path) -> int:
                 if previous_stage.get("mode") == "rigid_gfnff_symmetry":
                     plan_library = plan.get("library_name")
                     previous_row = results[index - 1]
+                    previous_asu = calc_dir / f"{previous_stage['prefix']}_asymmetric_unit.cif"
+                    if not previous_asu.is_file():
+                        raise FileNotFoundError(
+                            f"Previous rigid stage did not create its ASU file: {previous_asu.name}"
+                        )
                     from pygulp.rigid import build_symmetric_stage_input
 
                     gin_path.write_text(
