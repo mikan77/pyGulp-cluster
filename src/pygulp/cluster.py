@@ -511,7 +511,7 @@ def build_options(
         lines.append(connections_text.rstrip())
     lines.append(f"output movie cif {output_cif}")
     if restart_file:
-        lines.append(f"dump {restart_file}")
+        lines.append(f"dump every 1 {restart_file}")
     return "\n".join(lines).rstrip() + "\n"
 
 

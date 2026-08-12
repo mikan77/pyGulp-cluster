@@ -560,7 +560,7 @@ def build_symmetric_stage_input(
         "spacegroup",
         str(int(spacegroup_number)),
         f"output movie cif {stage['prefix']}.cif",
-        f"dump {stage['prefix']}.grs" if bool(stage.get("needs_restart")) else "",
+        f"dump every 1 {stage['prefix']}.grs" if bool(stage.get("needs_restart")) else "",
     ) if part)
     if library_name and "reaxff" in str(stage.get("keywords", "")).lower().split():
         generated = f"library {library_name}\n{generated}"

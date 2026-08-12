@@ -172,9 +172,14 @@ The included profile performs:
 3. an optional final single-point calculation
 
 Each non-final stage must be an optimisation. GULP passes its updated geometry
-and cell to the next stage through a native `.grs` restart file. By default the
-next stage requires `Optimisation achieved`; set `require_convergence: false`
-when a normally completed GULP run may continue after `max_function_calls`.
+and cell to the next stage through a native `.grs` restart file. For these
+stages pyGulp automatically writes the restart after every optimisation cycle
+using `dump every 1`, so a normally completed run with
+`require_convergence: false` can continue from the last saved geometry after
+`max_function_calls` or `Too many failed attempts to optimise`. The latter is
+accepted only when the restart file exists; syntax errors and missing restart
+files remain fatal. By default the next stage requires `Optimisation achieved`;
+set `require_convergence: false` to allow a non-converged but restartable stage.
 
 By default each stage does not enforce atom-count checks from `.got` output. Use
 `validate_atom_counts: true` in a stage block only if you want strict checking.

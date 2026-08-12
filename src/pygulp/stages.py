@@ -350,7 +350,7 @@ def rewrite_restart(
         kept.extend(["", options])
     kept.append(f"output movie cif {stage['prefix']}.cif")
     if bool(stage.get("needs_restart")):
-        kept.append(f"dump {stage['prefix']}.grs")
+        kept.append(f"dump every 1 {stage['prefix']}.grs")
     return "\n".join(kept).rstrip() + "\n"
 
 
@@ -467,9 +467,15 @@ def execute_stage_plan(plan_path: Path) -> int:
                 row.update({key: data.get(key) for key in STAGE_RESULT_FIELDS if key in data})
                 if validate_atom_counts:
                     validate_got_contract(data, expected_asu, expected_total)
-                if completed.returncode != 0:
-                    raise RuntimeError(f"GULP command returned exit code {completed.returncode}")
                 require_convergence = bool(stage.get("require_convergence", True))
+                restart_available = restart_path.is_file()
+                recoverable_optimizer_stop = (
+                    data.get("gulp_status") == "too_many_failed_attempts"
+                    and restart_available
+                    and not require_convergence
+                )
+                if completed.returncode != 0 and not recoverable_optimizer_stop:
+                    raise RuntimeError(f"GULP command returned exit code {completed.returncode}")
                 if require_convergence and not data.get("completed_normally"):
                     raise RuntimeError("GULP did not report normal completion")
                 converged = not bool(stage["is_optimisation"]) or data.get("gulp_status") == "optimisation_achieved"
