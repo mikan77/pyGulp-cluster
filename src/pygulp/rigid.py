@@ -348,15 +348,12 @@ def run_rigid_gfnff_symmetry_stage(calc_dir: Path, stage: dict[str, object], gul
     if tolerance <= 0.0:
         raise ValueError("symmetry.tolerance must be positive")
     allow_special = bool(options.get("allow_special_positions", False))
-    allow_split = bool(options.get("allow_split_molecules", False))
     asu, template = _load_asu(calc_dir)
     mult = float(options.get("natural_mult", 1.1))
     tags = infer_molecule_tags_natural_cutoffs(asu, include_periodic_bonds=True, mult=mult)
     groups = [np.where(tags == tag)[0] for tag in sorted(set(tags.tolist()))]
-    if any(len(group) < 2 for group in groups):
-        raise ValueError("Every independent rigid body must contain at least two atoms")
-    if not allow_split and len(asu) >= len(template):
-        raise ValueError("The prepared ASU is not smaller than the full cell; check symmetry preparation")
+    if not groups:
+        raise ValueError("The asymmetric unit contains no molecular groups")
 
     reference = asu.copy()
     _unwrap_groups(reference, groups)
