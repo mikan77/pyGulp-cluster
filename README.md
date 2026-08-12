@@ -31,6 +31,12 @@ For each input structure the program:
 - exports validated, Mercury-readable final CIF files as `relaxed_cifs/<ID>.cif`
 - counts molecules in the final expanded structure
 
+The symmetry-constrained rigid mode is selected with `mode: rigid_gfnff_symmetry`.
+The old `rigid_gfnff` mode has been removed. The new mode expands the ASU to a
+full P1 cell for pGFNFF gradient calculations, projects gradients back to
+independent rigid molecules, and preserves the selected space group during
+every accepted step.
+
 ## Supported Force Fields
 
 When `--library` is supplied, the active force field is determined from the library filename:

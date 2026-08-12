@@ -25,7 +25,7 @@ class StageSpec:
 
     @property
     def is_optimisation(self) -> bool:
-        if self.mode == "rigid_gfnff":
+        if self.mode == "rigid_gfnff_symmetry":
             return True
         words = set(re.findall(r"[A-Za-z_]+", self.keywords.lower()))
         return bool(words & {"opti", "optimise", "optimize"})
@@ -81,15 +81,16 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
             raise ValueError(f"Stage #{index} must be a mapping")
         raw_name = entry.get("name")
         mode = str(entry.get("mode", "gulp")).strip().lower()
-        if mode not in {"gulp", "rigid_gfnff"}:
+        if mode not in {"gulp", "rigid_gfnff_symmetry"}:
             raise ValueError(f"Stage #{index} has unsupported mode: {mode}")
         keywords = entry.get("keywords")
-        if mode == "rigid_gfnff" and keywords is None:
+        if mode == "rigid_gfnff_symmetry" and keywords is None:
             keywords = "gradient conp conse qok c6 gfnff gwolf noauto"
         options = entry.get("options", default_options)
-        require_convergence = entry.get("require_convergence", False if mode == "rigid_gfnff" else True)
+        require_convergence = entry.get("require_convergence", False if mode == "rigid_gfnff_symmetry" else True)
         validate_atom_counts = entry.get("validate_atom_counts", default_validate_atom_counts)
         rigid_options = entry.get("rigid", {})
+        symmetry_options = entry.get("symmetry", {})
         if not isinstance(raw_name, str) or not isinstance(keywords, str) or not keywords.strip():
             raise ValueError(f"Stage #{index} requires non-empty string fields 'name' and 'keywords'")
         if not isinstance(options, str):
@@ -100,6 +101,11 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
             raise ValueError(f"Stage #{index} field 'validate_atom_counts' must be true or false")
         if not isinstance(rigid_options, dict):
             raise ValueError(f"Stage #{index} field 'rigid' must be a mapping")
+        if not isinstance(symmetry_options, dict):
+            raise ValueError(f"Stage #{index} field 'symmetry' must be a mapping")
+        rigid_options = dict(rigid_options)
+        if symmetry_options:
+            rigid_options["symmetry"] = dict(symmetry_options)
         cleaned_name = sanitize_stage_name(raw_name)
         if cleaned_name in used_names:
             raise ValueError(f"Duplicate stage name: {raw_name}")
@@ -408,47 +414,30 @@ def execute_stage_plan(plan_path: Path) -> int:
                     stale_path.unlink()
             if index:
                 previous_stage = stages[index - 1]
-                if previous_stage.get("mode") == "rigid_gfnff":
+                if previous_stage.get("mode") == "rigid_gfnff_symmetry":
                     plan_library = plan.get("library_name")
                     previous_row = results[index - 1]
-                    if previous_row.get("rigid_resymmetrized"):
-                        from pygulp.rigid import build_resymmetrized_stage_input
+                    from pygulp.rigid import build_symmetric_stage_input
 
-                        gin_path.write_text(
-                            build_resymmetrized_stage_input(
-                                calc_dir=calc_dir,
-                                stage=stage,
-                                spacegroup_number=int(previous_row["rigid_spacegroup_number"]),
-                                library_name=str(plan_library) if plan_library else None,
-                            )
+                    gin_path.write_text(
+                        build_symmetric_stage_input(
+                            calc_dir=calc_dir,
+                            source_prefix=str(previous_stage["prefix"]),
+                            stage=stage,
+                            spacegroup_number=int(previous_row["rigid_spacegroup_number"]),
+                            library_name=str(plan_library) if plan_library else None,
                         )
-                    else:
-                        previous_input = calc_dir / f"{previous_stage['prefix']}.gin"
-                        if not previous_input.exists():
-                            raise FileNotFoundError(f"Previous rigid stage input is missing: {previous_input.name}")
-                        gin_path.write_text(
-                            rewrite_restart(
-                                previous_input.read_text(),
-                                _without_connect_options(stage),
-                                managed_heads - {"connect"},
-                                library_name=(
-                                    str(plan_library)
-                                    if plan_library
-                                    and "reaxff" in str(stage.get("keywords", "")).lower().split()
-                                    else None
-                                ),
-                            )
-                        )
+                    )
                 else:
                     previous_restart = calc_dir / f"{previous_stage['prefix']}.grs"
                     if not previous_restart.exists():
                         raise FileNotFoundError(f"Previous stage restart is missing: {previous_restart.name}")
                     gin_path.write_text(rewrite_restart(previous_restart.read_text(), stage, managed_heads))
 
-            if stage.get("mode") == "rigid_gfnff":
-                from pygulp.rigid import run_rigid_gfnff_stage
+            if stage.get("mode") == "rigid_gfnff_symmetry":
+                from pygulp.rigid import run_rigid_gfnff_symmetry_stage
 
-                data = run_rigid_gfnff_stage(
+                data = run_rigid_gfnff_symmetry_stage(
                     calc_dir=calc_dir,
                     stage=stage,
                     gulp_command=str(plan["gulp_command"]),
@@ -457,7 +446,7 @@ def execute_stage_plan(plan_path: Path) -> int:
                 row.update({key: data.get(key) for key in STAGE_RESULT_FIELDS if key in data})
                 row["rigid_scope"] = data.get("rigid_scope")
                 row["rigid_steps_completed"] = data.get("rigid_steps_completed")
-                row["rigid_resymmetrized"] = data.get("rigid_resymmetrized", False)
+                row["rigid_resymmetrized"] = data.get("rigid_resymmetrized", True)
                 row["rigid_spacegroup_number"] = data.get("rigid_spacegroup_number")
                 row["resymmetrization_status"] = data.get("resymmetrization_status")
                 converged = bool(data.get("converged"))

@@ -712,7 +712,7 @@ def build_stage_plan(
                 "validate_atom_counts": stage.validate_atom_counts,
                 "mode": stage.mode,
                 "rigid": stage.rigid_options,
-                "needs_restart": index < len(stages) - 1 and stage.mode != "rigid_gfnff",
+                "needs_restart": index < len(stages) - 1 and stage.mode != "rigid_gfnff_symmetry",
             }
         )
 
