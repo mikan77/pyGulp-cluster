@@ -134,20 +134,12 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
             inferred_cell_mode = "conv"
         elif inferred_cell_mode is None and has_conp:
             inferred_cell_mode = "conp"
-        name_hint = cleaned_name.lower()
         if inferred_cell_mode is None:
-            if "conv" in name_hint and "conp" not in name_hint:
-                inferred_cell_mode = "conv"
-            elif "conp" in name_hint and "conv" not in name_hint:
-                inferred_cell_mode = "conp"
+            inferred_cell_mode = None
         if inferred_cell_mode == "conv" and not has_conv:
             raise ValueError(f"Stage #{index} is declared as conv but keywords do not contain conv")
         if inferred_cell_mode == "conp" and not has_conp:
             raise ValueError(f"Stage #{index} is declared as conp but keywords do not contain conp")
-        if "conv" in name_hint and inferred_cell_mode != "conv":
-            raise ValueError(f"Stage #{index} name contains conv but keywords select {inferred_cell_mode or 'no cell mode'}")
-        if "conp" in name_hint and inferred_cell_mode != "conp":
-            raise ValueError(f"Stage #{index} name contains conp but keywords select {inferred_cell_mode or 'no cell mode'}")
         name = f"{index:02d}_{cleaned_name}"
         stages.append(
             StageSpec(
