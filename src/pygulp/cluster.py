@@ -697,6 +697,8 @@ def build_stage_plan(
     library_name: str | None,
     spacegroup_number: int,
     n_atoms_conventional: int,
+    expected_structure: dict[str, object],
+    natural_mult: float,
     calc_dir: Path,
     args,
 ) -> tuple[Path, Path]:
@@ -714,6 +716,7 @@ def build_stage_plan(
                 "require_convergence": stage.require_convergence,
                 "validate_atom_counts": stage.validate_atom_counts,
                 "mode": stage.mode,
+                "cell_mode": stage.cell_mode,
                 "rigid": stage.rigid_options,
                 "needs_restart": index < len(stages) - 1 and stage.mode != "rigid_gfnff_symmetry",
             }
@@ -741,6 +744,8 @@ def build_stage_plan(
     plan = {
         "n_atoms_asu": len(asu_atoms),
         "n_atoms_conventional": n_atoms_conventional,
+        "expected_structure": expected_structure,
+        "natural_mult": natural_mult,
         "spacegroup_number": spacegroup_number,
         "library_name": library_name,
         "validate_atom_counts": all(stage["validate_atom_counts"] for stage in stage_payloads),
@@ -1375,6 +1380,20 @@ def prepare_structure(
 
         summary = molecule_summary(atoms, tags, local_connections_by_tag)
         (work_dir / "molecule_summary.json").write_text(json.dumps(summary, indent=2))
+        expected_structure = {
+            "n_atoms": len(atoms),
+            "formula": dict(sorted(Counter(atoms.get_chemical_symbols()).items())),
+            "n_molecules": len(summary),
+            "n_edges": len(global_connections),
+            "n_isolated_atoms": 0,
+            "molecules": [
+                {
+                    "size": int(item["size"]),
+                    "formula": dict(sorted(item["formula"].items())),
+                }
+                for item in summary
+            ],
+        }
 
         symmetry_is_active = int(row["symmetry_operations"] or 1) > 1
         connections_text = ""
@@ -1399,6 +1418,8 @@ def prepare_structure(
                 library_name=library_name,
                 spacegroup_number=spacegroup_number,
                 n_atoms_conventional=len(atoms),
+                expected_structure=expected_structure,
+                natural_mult=args.natural_mult,
                 calc_dir=calc_dir,
                 args=args,
             )

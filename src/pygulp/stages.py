@@ -5,8 +5,12 @@ import json
 import re
 import shutil
 import subprocess
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from ase.io import read
+from ase.neighborlist import natural_cutoffs, neighbor_list
 
 
 @dataclass(frozen=True)
@@ -17,6 +21,7 @@ class StageSpec:
     require_convergence: bool = True
     validate_atom_counts: bool = False
     mode: str = "gulp"
+    cell_mode: str | None = None
     rigid_options: dict[str, object] = field(default_factory=dict)
 
     @property
@@ -49,6 +54,9 @@ STAGE_RESULT_FIELDS = (
     "cif",
     "restart",
     "rigid_steps_completed",
+    "structure_validation",
+    "n_molecules",
+    "n_isolated_atoms",
     "message",
 )
 
@@ -88,6 +96,11 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
         if mode == "rigid_gfnff_symmetry" and keywords is None:
             keywords = "gradient conp conse qok c6 gfnff gwolf noauto"
         options = entry.get("options", default_options)
+        cell_mode = entry.get("cell_mode")
+        if cell_mode is not None:
+            cell_mode = str(cell_mode).strip().lower()
+            if cell_mode not in {"conv", "conp"}:
+                raise ValueError(f"Stage #{index} field 'cell_mode' must be conv or conp")
         require_convergence = entry.get("require_convergence", False if mode == "rigid_gfnff_symmetry" else True)
         validate_atom_counts = entry.get("validate_atom_counts", default_validate_atom_counts)
         rigid_options = entry.get("rigid", {})
@@ -111,6 +124,30 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
         if cleaned_name in used_names:
             raise ValueError(f"Duplicate stage name: {raw_name}")
         used_names.add(cleaned_name)
+        keyword_words = set(re.findall(r"[A-Za-z_]+", keywords.lower()))
+        has_conv = "conv" in keyword_words
+        has_conp = "conp" in keyword_words
+        if has_conv and has_conp:
+            raise ValueError(f"Stage #{index} cannot contain both conv and conp")
+        inferred_cell_mode = cell_mode
+        if inferred_cell_mode is None and has_conv:
+            inferred_cell_mode = "conv"
+        elif inferred_cell_mode is None and has_conp:
+            inferred_cell_mode = "conp"
+        name_hint = cleaned_name.lower()
+        if inferred_cell_mode is None:
+            if "conv" in name_hint and "conp" not in name_hint:
+                inferred_cell_mode = "conv"
+            elif "conp" in name_hint and "conv" not in name_hint:
+                inferred_cell_mode = "conp"
+        if inferred_cell_mode == "conv" and not has_conv:
+            raise ValueError(f"Stage #{index} is declared as conv but keywords do not contain conv")
+        if inferred_cell_mode == "conp" and not has_conp:
+            raise ValueError(f"Stage #{index} is declared as conp but keywords do not contain conp")
+        if "conv" in name_hint and inferred_cell_mode != "conv":
+            raise ValueError(f"Stage #{index} name contains conv but keywords select {inferred_cell_mode or 'no cell mode'}")
+        if "conp" in name_hint and inferred_cell_mode != "conp":
+            raise ValueError(f"Stage #{index} name contains conp but keywords select {inferred_cell_mode or 'no cell mode'}")
         name = f"{index:02d}_{cleaned_name}"
         stages.append(
             StageSpec(
@@ -120,6 +157,7 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
                 require_convergence=require_convergence,
                 validate_atom_counts=validate_atom_counts,
                 mode=mode,
+                cell_mode=inferred_cell_mode,
                 rigid_options=dict(rigid_options),
             )
         )
@@ -324,25 +362,118 @@ def _managed_option_heads(stages: list[dict[str, object]]) -> set[str]:
     return heads
 
 
+def _restart_structure(restart_text: str) -> str:
+    """Return only the structural part of a GULP restart.
+
+    GFNFF restart blocks are deliberately discarded. They are generated state,
+    not portable input, and must be rebuilt by GULP for the next stage.
+    """
+
+    lines = restart_text.splitlines()
+    title_index = next((i for i, line in enumerate(lines) if line.strip().lower() == "title"), None)
+    if title_index is None:
+        raise ValueError("GULP restart does not contain a title block")
+
+    space_index = next(
+        (i for i in range(title_index, len(lines)) if lines[i].strip().lower() in {"space", "spacegroup"}),
+        None,
+    )
+    if space_index is None or space_index + 1 >= len(lines):
+        raise ValueError("GULP restart does not contain a space-group block")
+
+    return "\n".join(lines[title_index : space_index + 2]).rstrip()
+
+
+def _structure_signature(atoms, mult: float) -> dict[str, object]:
+    atoms = atoms.copy()
+    atoms.set_pbc([True, True, True])
+    symbols = atoms.get_chemical_symbols()
+    cutoffs = natural_cutoffs(atoms, mult=mult)
+    first, second, _ = neighbor_list("ijS", atoms, cutoffs)
+    edges: set[tuple[int, int]] = set()
+    adjacency = [set() for _ in atoms]
+    for i, j in zip(first, second):
+        i, j = int(i), int(j)
+        if i == j:
+            continue
+        edge = tuple(sorted((i, j)))
+        edges.add(edge)
+        adjacency[i].add(j)
+        adjacency[j].add(i)
+
+    components: list[list[int]] = []
+    seen: set[int] = set()
+    for start in range(len(atoms)):
+        if start in seen:
+            continue
+        queue: deque[int] = deque([start])
+        seen.add(start)
+        component: list[int] = []
+        while queue:
+            current = queue.popleft()
+            component.append(current)
+            for neighbour in adjacency[current]:
+                if neighbour not in seen:
+                    seen.add(neighbour)
+                    queue.append(neighbour)
+        components.append(component)
+
+    signatures = []
+    for component in components:
+        formula = Counter(symbols[index] for index in component)
+        signatures.append(
+            {
+                "size": len(component),
+                "formula": dict(sorted(formula.items())),
+            }
+        )
+    signatures.sort(key=lambda item: (int(item["size"]), tuple(item["formula"].items())))
+    return {
+        "n_atoms": len(atoms),
+        "formula": dict(sorted(Counter(symbols).items())),
+        "n_molecules": len(components),
+        "n_edges": len(edges),
+        "n_isolated_atoms": sum(not neighbours for neighbours in adjacency),
+        "molecules": signatures,
+    }
+
+
+def validate_structure_output(
+    cif_path: Path,
+    expected: dict[str, object],
+    mult: float,
+    report_path: Path,
+) -> dict[str, object]:
+    if not cif_path.is_file():
+        raise FileNotFoundError(f"GULP did not write structure CIF {cif_path.name}")
+    actual = _structure_signature(read(cif_path), mult)
+    expected_molecules = sorted(
+        expected.get("molecules", []),
+        key=lambda item: (int(item["size"]), tuple(item["formula"].items())),
+    )
+    mismatches = []
+    for key in ("n_atoms", "formula", "n_molecules", "n_edges", "n_isolated_atoms"):
+        if actual[key] != expected.get(key):
+            mismatches.append(f"{key}: expected {expected.get(key)!r}, got {actual[key]!r}")
+    if actual["molecules"] != expected_molecules:
+        mismatches.append(
+            f"molecules: expected {expected_molecules!r}, got {actual['molecules']!r}"
+        )
+    report = {"status": "valid" if not mismatches else "invalid", "expected": expected, "actual": actual, "mismatches": mismatches}
+    report_path.write_text(json.dumps(report, indent=2) + "\n")
+    if mismatches:
+        raise RuntimeError(f"Structure validation failed for {cif_path.name}: " + "; ".join(mismatches))
+    return actual
+
+
 def rewrite_restart(
     restart_text: str,
     stage: dict[str, object],
     managed_heads: set[str],
     library_name: str | None = None,
 ) -> str:
-    lines = restart_text.splitlines()
-    title_index = next((index for index, line in enumerate(lines) if line.strip().lower() == "title"), None)
-    if title_index is None:
-        raise ValueError("GULP restart does not contain a title block")
-
-    filtered = []
-    for line in lines[title_index:]:
-        words = line.split()
-        if words and words[0].lower() in managed_heads:
-            continue
-        filtered.append(line)
-
-    kept = [*str(stage["keywords"]).splitlines(), *filtered]
+    del managed_heads
+    kept = [*str(stage["keywords"]).splitlines(), _restart_structure(restart_text)]
     if library_name and not any(line.strip().lower().startswith("library ") for line in kept):
         kept.append(f"library {library_name}")
     options = str(stage.get("options", "")).rstrip()
@@ -382,6 +513,10 @@ def execute_stage_plan(plan_path: Path) -> int:
     expected_asu = int(plan["n_atoms_asu"])
     expected_total = int(plan["n_atoms_conventional"])
     validate_atom_counts = bool(plan.get("validate_atom_counts", False))
+    expected_structure = plan.get("expected_structure")
+    natural_mult = float(plan.get("natural_mult", 1.1))
+    if not isinstance(expected_structure, dict):
+        expected_structure = None
     results: list[dict[str, object]] = []
     last_cif: Path | None = None
 
@@ -438,7 +573,15 @@ def execute_stage_plan(plan_path: Path) -> int:
                     previous_restart = calc_dir / f"{previous_stage['prefix']}.grs"
                     if not previous_restart.exists():
                         raise FileNotFoundError(f"Previous stage restart is missing: {previous_restart.name}")
-                    gin_path.write_text(rewrite_restart(previous_restart.read_text(), stage, managed_heads))
+                    plan_library = plan.get("library_name")
+                    gin_path.write_text(
+                        rewrite_restart(
+                            previous_restart.read_text(),
+                            stage,
+                            managed_heads,
+                            library_name=str(plan_library) if plan_library else None,
+                        )
+                    )
 
             if stage.get("mode") == "rigid_gfnff_symmetry":
                 from pygulp.rigid import run_rigid_gfnff_symmetry_stage
@@ -482,6 +625,16 @@ def execute_stage_plan(plan_path: Path) -> int:
                 row["converged"] = converged
                 if bool(stage["is_optimisation"]) and require_convergence and not converged:
                     raise RuntimeError(str(data.get("gulp_status") or "optimisation did not converge"))
+            if expected_structure is not None:
+                validation = validate_structure_output(
+                    cif_path,
+                    expected_structure,
+                    natural_mult,
+                    calc_dir / f"{prefix}.structure_validation.json",
+                )
+                row["structure_validation"] = "valid"
+                row["n_molecules"] = validation["n_molecules"]
+                row["n_isolated_atoms"] = validation["n_isolated_atoms"]
             if stage.get("needs_restart") and not restart_path.exists():
                 raise FileNotFoundError(f"GULP did not write restart file {restart_path.name}")
 
