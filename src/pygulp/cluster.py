@@ -130,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--cif-structure-mode",
         dest="relaxed_cif_mode",
         choices=("refined", "conventional", "primitive", "full_p1"),
-        default="full_p1",
+        default="refined",
         help=(
             "Structure representation used before writing collected CIF files. "
             "Use full_p1 to write every atom explicitly without CIF symmetry expansion."
