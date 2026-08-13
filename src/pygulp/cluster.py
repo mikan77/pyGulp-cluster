@@ -129,9 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--relaxed-cif-mode",
         "--cif-structure-mode",
         dest="relaxed_cif_mode",
-        choices=("refined", "conventional", "primitive"),
-        default="refined",
-        help="Structure representation used before writing collected CIF files.",
+        choices=("refined", "conventional", "primitive", "full_p1"),
+        default="full_p1",
+        help=(
+            "Structure representation used before writing collected CIF files. "
+            "Use full_p1 to write every atom explicitly without CIF symmetry expansion."
+        ),
     )
     parser.add_argument(
         "--symprec",
@@ -856,6 +859,11 @@ def resolve_relaxed_cif_output_dir(output_dir: Path, relaxed_cif_dir: Path | Non
 
 
 def structure_for_relaxed_cif_mode(analyzer, mode: str):
+    if mode == "full_p1":
+        # get_refined_structure() contains the complete conventional cell.
+        # It must be written with symprec=None below; otherwise CifWriter may
+        # compress it back to an ASU plus symmetry operations.
+        return analyzer.get_refined_structure()
     if mode == "refined":
         return analyzer.get_refined_structure()
     if mode == "conventional":
@@ -908,7 +916,7 @@ def rewrite_relaxed_cif_with_symmetry(
             output_cif.parent.mkdir(parents=True, exist_ok=True)
             writer = CifWriter(
                 converted,
-                symprec=symprec,
+                symprec=None if mode == "full_p1" else symprec,
                 angle_tolerance=angle_tolerance,
                 significant_figures=significant_figures,
                 refine_struct=False,
