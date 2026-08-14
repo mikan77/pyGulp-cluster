@@ -717,6 +717,11 @@ def build_stage_plan(
                 "validate_atom_counts": stage.validate_atom_counts,
                 "mode": stage.mode,
                 "cell_mode": stage.cell_mode,
+                "symmetry_mode": stage.symmetry_mode,
+                "symprec": args.symprec,
+                "n_atoms_asu": len(asu_atoms) if index == 0 else None,
+                "n_atoms_total": n_atoms_conventional if index == 0 else None,
+                "spacegroup_number": spacegroup_number if index == 0 else None,
                 "rigid": stage.rigid_options,
                 "needs_restart": index < len(stages) - 1 and stage.mode != "rigid_gfnff_symmetry",
             }
@@ -749,6 +754,9 @@ def build_stage_plan(
         "spacegroup_number": spacegroup_number,
         "library_name": library_name,
         "validate_atom_counts": all(stage["validate_atom_counts"] for stage in stage_payloads),
+        "include_periodic_bonds": not args.exclude_periodic_bonds,
+        "force_no_symmetry": bool(args.no_symmetry),
+        "final_symmetry": dict(stages[0].final_symmetry),
         "gulp_command": stage_gulp_command(args),
         "stages": stage_payloads,
     }
@@ -976,8 +984,11 @@ def detect_relaxed_cif_symmetry(
     relaxed_cif_path: Path,
     symprec: float,
     angle_tolerance: float,
+    required: bool = True,
 ) -> tuple[str | None, int | None]:
     if not relaxed_cif_path.exists():
+        if required:
+            raise FileNotFoundError(f"Final relaxed CIF does not exist: {relaxed_cif_path}")
         return None, None
 
     try:
@@ -988,9 +999,37 @@ def detect_relaxed_cif_symmetry(
             warnings.simplefilter("ignore")
             structure = Structure.from_file(str(relaxed_cif_path))
             analyzer = SpacegroupAnalyzer(structure, symprec=symprec, angle_tolerance=angle_tolerance)
-            return analyzer.get_space_group_symbol(), analyzer.get_space_group_number()
-    except Exception:
+            symbol = analyzer.get_space_group_symbol()
+            number = analyzer.get_space_group_number()
+            if required and (not symbol or number is None):
+                raise ValueError("pymatgen returned no space-group result")
+            return symbol, number
+    except Exception as exc:
+        if required:
+            raise ValueError(f"Could not determine final CIF symmetry: {relaxed_cif_path}") from exc
         return None, None
+
+
+def final_symmetry_settings(
+    calc_dir: Path,
+    default_symprec: float,
+    default_angle_tolerance: float,
+) -> tuple[bool, float, float]:
+    plan_path = calc_dir / "stage_plan.json"
+    if not plan_path.exists():
+        return True, default_symprec, default_angle_tolerance
+    try:
+        payload = json.loads(plan_path.read_text())
+        settings = payload.get("final_symmetry", {})
+        if not isinstance(settings, dict):
+            raise ValueError("final_symmetry must be a mapping")
+        return (
+            bool(settings.get("required", True)),
+            float(settings.get("symprec", default_symprec)),
+            float(settings.get("angle_tolerance", default_angle_tolerance)),
+        )
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid final_symmetry settings in {plan_path}") from exc
 
 
 def resolve_final_got_path(calc_dir: Path) -> Path:
@@ -1087,6 +1126,7 @@ def enrich_row_from_outputs(
     symprec: float = 0.01,
     angle_tolerance: float = 5.0,
     validate_atom_counts: bool = True,
+    final_symmetry_required: bool = True,
 ) -> dict[str, object]:
     got_data = parse_got(got_path)
     expected_asu = row.get("n_atoms_asu")
@@ -1144,6 +1184,7 @@ def enrich_row_from_outputs(
             relaxed_cif_path=relaxed_cif_path,
             symprec=symprec,
             angle_tolerance=angle_tolerance,
+            required=final_symmetry_required,
         )
         row["final_spacegroup"] = symmetry
         row["final_spacegroup_number"] = symmetry_number
@@ -1193,12 +1234,17 @@ def export_final_cif(row: dict[str, object], args, log_path: Path, used_names: s
         row["cif_status"] = "missing_relaxed_cif"
         return
 
+    _, final_symprec, final_angle_tolerance = final_symmetry_settings(
+        Path(str(row["_work_dir"])) / "CalcFold",
+        args.symprec,
+        args.relaxed_cif_angle_tolerance,
+    )
     cif_row = rewrite_relaxed_cif_with_symmetry(
         source_cif=source_cif,
         output_cif=output_cif,
         mode=args.relaxed_cif_mode,
-        symprec=args.symprec,
-        angle_tolerance=args.relaxed_cif_angle_tolerance,
+        symprec=final_symprec,
+        angle_tolerance=final_angle_tolerance,
         significant_figures=args.relaxed_cif_significant_figures,
     )
     row["cif_status"] = cif_row["status"]
@@ -1323,10 +1369,11 @@ def prepare_structure(
         shutil.copy2(poscar, work_dir / poscar.name)
         write(input_cif_path, input_atoms)
 
+        initial_symmetry_disabled = args.no_symmetry or bool(stages and stages[0].symmetry_mode == "off")
         atoms, asu_atoms, symmetry = prepare_symmetry(
             input_atoms,
             symprec=args.symprec,
-            disabled=args.no_symmetry,
+            disabled=initial_symmetry_disabled,
         )
         row.update({key: value for key, value in symmetry.items() if not key.startswith("_")})
         row["n_atoms_conventional"] = len(atoms)
@@ -1599,13 +1646,19 @@ def wait_for_jobs(
                 if job.row.get("failed_stage"):
                     validate_atom_counts = False
                 job.got_path = resolve_final_got_path(job.calc_dir)
+                final_symmetry_required, final_symprec, final_angle_tolerance = final_symmetry_settings(
+                    job.calc_dir,
+                    args.symprec,
+                    args.relaxed_cif_angle_tolerance,
+                )
                 got_data = enrich_row_from_outputs(
                     row=job.row,
                     got_path=job.got_path,
                     relaxed_cif_path=job.relaxed_cif_path,
-                    symprec=args.symprec,
-                    angle_tolerance=args.relaxed_cif_angle_tolerance,
+                    symprec=final_symprec,
+                    angle_tolerance=final_angle_tolerance,
                     validate_atom_counts=validate_atom_counts,
+                    final_symmetry_required=final_symmetry_required and not bool(job.row.get("failed_stage")),
                 )
                 if not job.row.get("failed_stage"):
                     job.row["status"] = determine_final_status(slurm_state, got_data, job.relaxed_cif_path)
@@ -1665,14 +1718,20 @@ def collect_existing_result(index: int, poscar: Path, args, log_path: Path) -> d
 
     if got_path.exists():
         try:
+            final_symmetry_required, final_symprec, final_angle_tolerance = final_symmetry_settings(
+                calc_dir,
+                args.symprec,
+                args.relaxed_cif_angle_tolerance,
+            )
             got_data = enrich_row_from_outputs(
                 row=row,
                 got_path=got_path,
                 relaxed_cif_path=relaxed_cif_path,
-                symprec=args.symprec,
-                angle_tolerance=args.relaxed_cif_angle_tolerance,
+                symprec=final_symprec,
+                angle_tolerance=final_angle_tolerance,
                 validate_atom_counts=bool(row.get("validate_atom_counts", False))
                 and not bool(row.get("failed_stage")),
+                final_symmetry_required=final_symmetry_required and not bool(row.get("failed_stage")),
             )
             row["status"] = determine_final_status("COMPLETED", got_data, relaxed_cif_path)
         except Exception as exc:

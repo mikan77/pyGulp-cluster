@@ -7,10 +7,19 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from ase.build import bulk
+from ase.io import write
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from pygulp.stages import execute_stage_plan, parse_got, rewrite_restart, validate_got_contract
+from pygulp.stages import (
+    _stage_input_from_cif,
+    execute_stage_plan,
+    parse_got,
+    rewrite_restart,
+    validate_got_contract,
+)
 
 
 def main() -> None:
@@ -42,7 +51,24 @@ dump old.grs
     assert "conp" in rewritten and "conv" not in rewritten
     assert "maxcyc 100" not in rewritten and "maxcyc 500" in rewritten
     assert "output movie cif 02_variable_cell.cif" in rewritten
-    assert "dump 02_variable_cell.grs" in rewritten
+    assert "dump every 1 02_variable_cell.grs" in rewritten
+
+    with TemporaryDirectory() as directory:
+        source_cif = Path(directory) / "diamond.cif"
+        write(source_cif, bulk("Si", "diamond", a=5.43, cubic=True))
+        auto_stage = {
+            "prefix": "02_auto",
+            "keywords": "opti reaxff conp",
+            "options": "gtol 1e-3",
+            "symmetry_mode": "auto",
+            "symprec": 0.05,
+            "needs_restart": True,
+        }
+        off_stage = {**auto_stage, "prefix": "02_off", "symmetry_mode": "off"}
+        _stage_input_from_cif(source_cif, auto_stage, 1.1, None, True)
+        _stage_input_from_cif(source_cif, off_stage, 1.1, None, True)
+        assert (auto_stage["n_atoms_asu"], auto_stage["n_atoms_total"], auto_stage["spacegroup_number"]) == (1, 8, 227)
+        assert (off_stage["n_atoms_asu"], off_stage["n_atoms_total"], off_stage["spacegroup_number"]) == (8, 8, 1)
 
     with TemporaryDirectory() as directory:
         calc_dir = Path(directory)

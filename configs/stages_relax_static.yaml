@@ -1,5 +1,11 @@
+final_symmetry:
+  required: true
+  symprec: 0.05
+  angle_tolerance: 5.0
+
 stages:
   - name: fixed_cell
+    symmetry_mode: "off"
     require_convergence: false
     # Set to false only if GULP output format does not print atom-count checks
     validate_atom_counts: false
@@ -14,6 +20,7 @@ stages:
       stepmx 0.05
 
   - name: variable_cell
+    symmetry_mode: auto
     require_convergence: false
     keywords: |
       opti conj reaxff conp qiter spat
@@ -26,6 +33,7 @@ stages:
       stepmx 0.02
 
   - name: static
+    symmetry_mode: auto
     keywords: |
       single reaxff qiter spat
       parallel better_scaling

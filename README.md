@@ -191,9 +191,15 @@ If your workflow needs full validation for all stages, either:
 Example configuration:
 
 ```yaml
+final_symmetry:
+  required: true
+  symprec: 0.05
+  angle_tolerance: 5.0
+
 validate_atom_counts: true   # optional, applies to all stages by default
 stages:
   - name: fixed_cell
+    symmetry_mode: "off"
     require_convergence: false
     validate_atom_counts: true
     keywords: |
@@ -204,6 +210,7 @@ stages:
       stepmx 0.05
 
   - name: variable_cell
+    symmetry_mode: auto
     require_convergence: false
     validate_atom_counts: true
     keywords: |
@@ -214,7 +221,19 @@ stages:
       stepmx 0.02
 ```
 
-Without `--stages-file`, the original single-stage workflow is unchanged.
+For ordinary GULP stages, `symmetry_mode: "off"` relaxes the full structure in
+P1. `symmetry_mode: auto` reads the previous stage CIF, determines its current
+symmetry, builds a new asymmetric unit, and writes the next GULP input from
+that structure. The default is `auto`. The rigid GFNFF mode always preserves
+symmetry and cannot use `off`.
+
+After the last stage the final `relaxed.cif` is always checked for symmetry.
+`P1` is a valid result; a missing or unreadable final CIF is an error when
+`final_symmetry.required: true`. The check does not modify the final geometry.
+The YAML values control the tolerances used for this final analysis.
+
+Without `--stages-file`, the single-stage input workflow is unchanged; the
+final CIF symmetry check uses the CLI tolerances.
 
 ## Job Script Handling
 

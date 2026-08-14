@@ -12,6 +12,11 @@ from pathlib import Path
 from ase.io import read
 from ase.neighborlist import natural_cutoffs, neighbor_list
 
+from pygulp.molecule.connections import (
+    infer_molecule_tags_natural_cutoffs,
+    infer_natural_cutoff_connections,
+)
+
 
 @dataclass(frozen=True)
 class StageSpec:
@@ -22,7 +27,9 @@ class StageSpec:
     validate_atom_counts: bool = False
     mode: str = "gulp"
     cell_mode: str | None = None
+    symmetry_mode: str = "auto"
     rigid_options: dict[str, object] = field(default_factory=dict)
+    final_symmetry: dict[str, object] = field(default_factory=dict)
 
     @property
     def prefix(self) -> str:
@@ -49,6 +56,8 @@ STAGE_RESULT_FIELDS = (
     "runtime_seconds",
     "n_atoms_irreducible",
     "n_atoms_total",
+    "symmetry_mode",
+    "spacegroup_number",
     "gin",
     "got",
     "cif",
@@ -85,6 +94,26 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
     if not isinstance(default_validate_atom_counts, bool):
         raise ValueError("Top-level field 'validate_atom_counts' must be true or false")
 
+    final_symmetry = payload.get("final_symmetry", {})
+    if not isinstance(final_symmetry, dict):
+        raise ValueError("Top-level field 'final_symmetry' must be a mapping")
+    final_symmetry = dict(final_symmetry)
+    required = final_symmetry.get("required", True)
+    if not isinstance(required, bool):
+        raise ValueError("final_symmetry.required must be true or false")
+    try:
+        final_symprec = float(final_symmetry.get("symprec", 0.05))
+        final_angle_tolerance = float(final_symmetry.get("angle_tolerance", 5.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("final_symmetry tolerances must be numbers") from exc
+    if final_symprec <= 0.0 or final_angle_tolerance <= 0.0:
+        raise ValueError("final_symmetry tolerances must be positive")
+    final_symmetry = {
+        "required": required,
+        "symprec": final_symprec,
+        "angle_tolerance": final_angle_tolerance,
+    }
+
     for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
             raise ValueError(f"Stage #{index} must be a mapping")
@@ -92,6 +121,15 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
         mode = str(entry.get("mode", "gulp")).strip().lower()
         if mode not in {"gulp", "rigid_gfnff_symmetry"}:
             raise ValueError(f"Stage #{index} has unsupported mode: {mode}")
+        raw_symmetry_mode = entry.get("symmetry_mode", "auto")
+        if isinstance(raw_symmetry_mode, bool):
+            symmetry_mode = "auto" if raw_symmetry_mode else "off"
+        else:
+            symmetry_mode = str(raw_symmetry_mode).strip().lower()
+        if symmetry_mode not in {"auto", "off"}:
+            raise ValueError(f"Stage #{index} symmetry_mode must be auto or off")
+        if mode == "rigid_gfnff_symmetry" and symmetry_mode == "off":
+            raise ValueError(f"Stage #{index} rigid_gfnff_symmetry requires symmetry_mode: auto")
         keywords = entry.get("keywords")
         if mode == "rigid_gfnff_symmetry" and keywords is None:
             keywords = "gradient conp conse qok c6 gfnff gwolf noauto"
@@ -150,7 +188,9 @@ def load_stage_specs(path: Path, default_options: str) -> list[StageSpec]:
                 validate_atom_counts=validate_atom_counts,
                 mode=mode,
                 cell_mode=inferred_cell_mode,
+                symmetry_mode=symmetry_mode,
                 rigid_options=dict(rigid_options),
+                final_symmetry=final_symmetry,
             )
         )
 
@@ -487,6 +527,83 @@ def _without_connect_options(stage: dict[str, object]) -> dict[str, object]:
     return cleaned
 
 
+def _stage_options(stage: dict[str, object], connections: str, needs_restart: bool) -> str:
+    kept: list[str] = []
+    skip_next = False
+    for line in str(stage.get("options", "")).splitlines():
+        words = line.split()
+        if skip_next:
+            skip_next = False
+            continue
+        if words and words[0].lower() in {"connect", "output", "dump"}:
+            continue
+        if words and words[0].lower() == "spacegroup":
+            skip_next = True
+            continue
+        kept.append(line)
+    parts = ["\n".join(kept).strip(), connections.strip()]
+    parts.append(f"output movie cif {stage['prefix']}.cif")
+    if needs_restart:
+        parts.append(f"dump every 1 {stage['prefix']}.grs")
+    return "\n".join(part for part in parts if part)
+
+
+def _stage_input_from_cif(
+    source_cif: Path,
+    stage: dict[str, object],
+    natural_mult: float,
+    library_name: str | None,
+    include_periodic_bonds: bool,
+    force_no_symmetry: bool = False,
+) -> str:
+    from pygulp.cluster import prepare_symmetry, render_gulp_input, validate_gin_contract
+
+    atoms = read(source_cif)
+    atoms.set_pbc([True, True, True])
+    symmetry_mode = "off" if force_no_symmetry else str(stage.get("symmetry_mode", "auto")).lower()
+    conventional, asu, metadata = prepare_symmetry(
+        atoms,
+        symprec=float(stage.get("symprec", 0.05)),
+        disabled=symmetry_mode == "off",
+    )
+    active = symmetry_mode == "auto" and int(metadata.get("symmetry_operations", 1)) > 1
+    calculation_atoms = asu if active else conventional
+    spacegroup_number = int(metadata.get("gulp_spacegroup_number", 1)) if active else 1
+
+    connections = ""
+    if not active:
+        tags = infer_molecule_tags_natural_cutoffs(
+            conventional,
+            include_periodic_bonds=include_periodic_bonds,
+            mult=natural_mult,
+        )
+        conventional.set_tags(tags)
+        pairs = infer_natural_cutoff_connections(
+            conventional,
+            molecule_tag=None,
+            same_tag_only=True,
+            include_periodic_bonds=include_periodic_bonds,
+            index_base=1,
+            local_indexing=False,
+            mult=natural_mult,
+        )
+        connections = "\n".join(f"connect {first} {second}" for first, second in pairs)
+
+    stage["n_atoms_asu"] = len(calculation_atoms)
+    stage["n_atoms_total"] = len(conventional)
+    stage["spacegroup_number"] = spacegroup_number
+    options = _stage_options(stage, connections, bool(stage.get("needs_restart")))
+    gin = render_gulp_input(
+        calculation_atoms,
+        str(stage["keywords"]),
+        options,
+        library_name,
+        spacegroup_number=spacegroup_number,
+    )
+    validate_gin_contract(gin, len(calculation_atoms), spacegroup_number)
+    return gin
+
+
 def write_stage_results(calc_dir: Path, rows: list[dict[str, object]]) -> None:
     (calc_dir / "stage_results.json").write_text(json.dumps(rows, indent=2) + "\n")
     with (calc_dir / "stages.csv").open("w", newline="") as stream:
@@ -531,6 +648,8 @@ def execute_stage_plan(plan_path: Path) -> int:
             "got": got_path.name,
             "cif": cif_path.name,
             "restart": restart_path.name if stage.get("needs_restart") else "",
+            "symmetry_mode": stage.get("symmetry_mode", "auto"),
+            "spacegroup_number": stage.get("spacegroup_number", plan.get("spacegroup_number", 1)),
             "message": "",
         }
         results.append(row)
@@ -542,8 +661,21 @@ def execute_stage_plan(plan_path: Path) -> int:
                     stale_path.unlink()
             if index:
                 previous_stage = stages[index - 1]
-                if previous_stage.get("mode") == "rigid_gfnff_symmetry":
-                    plan_library = plan.get("library_name")
+                if "symmetry_mode" in stage and stage.get("mode") != "rigid_gfnff_symmetry":
+                    previous_cif = calc_dir / f"{previous_stage['prefix']}.cif"
+                    if not previous_cif.is_file():
+                        raise FileNotFoundError(f"Previous stage CIF is missing: {previous_cif.name}")
+                    gin_path.write_text(
+                        _stage_input_from_cif(
+                            source_cif=previous_cif,
+                            stage=stage,
+                            natural_mult=natural_mult,
+                            library_name=str(plan.get("library_name")) if plan.get("library_name") else None,
+                            include_periodic_bonds=bool(plan.get("include_periodic_bonds", True)),
+                            force_no_symmetry=bool(plan.get("force_no_symmetry", False)),
+                        )
+                    )
+                elif previous_stage.get("mode") == "rigid_gfnff_symmetry":
                     previous_row = results[index - 1]
                     previous_asu = calc_dir / f"{previous_stage['prefix']}_asymmetric_unit.cif"
                     if not previous_asu.is_file():
@@ -558,20 +690,19 @@ def execute_stage_plan(plan_path: Path) -> int:
                             source_prefix=str(previous_stage["prefix"]),
                             stage=stage,
                             spacegroup_number=int(previous_row["rigid_spacegroup_number"]),
-                            library_name=str(plan_library) if plan_library else None,
+                            library_name=str(plan.get("library_name")) if plan.get("library_name") else None,
                         )
                     )
                 else:
                     previous_restart = calc_dir / f"{previous_stage['prefix']}.grs"
                     if not previous_restart.exists():
                         raise FileNotFoundError(f"Previous stage restart is missing: {previous_restart.name}")
-                    plan_library = plan.get("library_name")
                     gin_path.write_text(
                         rewrite_restart(
                             previous_restart.read_text(),
                             stage,
                             managed_heads,
-                            library_name=str(plan_library) if plan_library else None,
+                            library_name=str(plan.get("library_name")) if plan.get("library_name") else None,
                         )
                     )
 
@@ -600,8 +731,14 @@ def execute_stage_plan(plan_path: Path) -> int:
                 completed = subprocess.run(command, cwd=calc_dir, shell=True, check=False)
                 data = parse_got(got_path)
                 row.update({key: data.get(key) for key in STAGE_RESULT_FIELDS if key in data})
+                row["symmetry_mode"] = stage.get("symmetry_mode", "auto")
+                row["spacegroup_number"] = stage.get("spacegroup_number", plan.get("spacegroup_number", 1))
                 if validate_atom_counts:
-                    validate_got_contract(data, expected_asu, expected_total)
+                    validate_got_contract(
+                        data,
+                        int(stage.get("n_atoms_asu") or expected_asu),
+                        int(stage.get("n_atoms_total") or expected_total),
+                    )
                 require_convergence = bool(stage.get("require_convergence", True))
                 restart_available = restart_path.is_file()
                 recoverable_optimizer_stop = (
